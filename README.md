@@ -80,3 +80,7 @@ VRAM 피크로 실패하면 --seq / --d_model / --n_layer / --batch 를 줄이�
 
 CUDA illegal access → 위 모델 파라미터 축소, BLESS_SAFE_GEMM=1 유지.
 
+
+5) 시각화 방법
+python viz_squad_window.py --focus-squad 880 --span 15
+
