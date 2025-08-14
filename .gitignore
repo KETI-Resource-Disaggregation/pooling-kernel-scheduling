@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.pytest_cache/
+
+# CUDA/C++ build
+*.so
+*.dll
+*.dylib
+*.o
+build/
+dist/
+
+# Logs & data
+*.csv
+*.log
+*.out
+*.png
+*.pdf
+events_master.csv
+squad_log.csv
+pmon*.txt
+
+# Local dirs not for repo
+archive/
+tests/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
