@@ -1,44 +1,72 @@
-# controller/cutlass_linear.py
 import os
 import torch
 import torch.nn as nn
+import ctypes
 
-# 안전 경로 스위치: 기본 안전(on). 나중에 고속 경로 붙이면 여기서 분기하면 됨.
+# bless bind
+def _load_bless_symbols():
+    try:
+        lib = ctypes.CDLL(None)
+        _bind = getattr(lib, "bless_bind_thread")
+        _bind.argtypes = [ctypes.c_int]
+        _bind.restype = None
+        _curr = getattr(lib, "bless_current_route")
+        _curr.restype = ctypes.c_int  # 0=LIMITED, 1=UNLIMITED
+        return _bind, _curr
+    except Exception:
+        return None, None
+
+_BLESS_BIND, _BLESS_CURR = _load_bless_symbols()
+def _bind_to_route_if_possible():
+    if _BLESS_BIND and _BLESS_CURR:
+        try:
+            r = int(_BLESS_CURR())
+            _BLESS_BIND(1 if r == 1 else 0)
+        except Exception:
+            pass
+
 SAFE = os.environ.get("BLESS_SAFE_GEMM", "1") == "1"
 
 def _matmul2d_safe(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """항상 2D, contiguous, float32 보장 후 torch.matmul 사용."""
-    if A.dim() != 2:
-        A = A.reshape(A.size(0), -1)
-    if B.dim() != 2:
-        B = B.reshape(B.size(0), -1)
+    _bind_to_route_if_possible()  # cuBLAS 실행 전 현재 route 바인딩
+
+    if A.dim() != 2: A = A.reshape(A.size(0), -1)
+    if B.dim() != 2: B = B.reshape(B.size(0), -1)
+
     A = A.contiguous()
     B = B.contiguous()
-    if A.dtype != torch.float32:
-        A = A.float()
-    if B.dtype != torch.float32:
-        B = B.float()
+
+    if A.dtype != torch.float32: A = A.float()
+    if B.dtype != torch.float32: B = B.float()
+
     return torch.matmul(A, B)
 
 def matmul2d(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # 지금은 안정성이 최우선 → 항상 safe 경로
-    # (추후 CUTLASS/Triton 붙일 때 SAFE==False 분기 추가)
     return _matmul2d_safe(A, B)
 
 class MyLinear(nn.Module):
-    """x[... , in_f] * W[out_f, in_f]^T + b"""
+    """y = x[... , in_f] @ W[out_f, in_f]^T + b"""
     def __init__(self, in_f: int, out_f: int, bias: bool = True):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(out_f, in_f))
-        self.bias   = nn.Parameter(torch.zeros(out_f)) if bias else None
+        # CPU에서 파라미터 생성(컨텍스트 충돌 방지)
+        self.weight = nn.Parameter(torch.empty(out_f, in_f, device="cpu"))
+        self.bias = nn.Parameter(torch.zeros(out_f, device="cpu")) if bias else None
         nn.init.trunc_normal_(self.weight, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_f  = self.weight.size(1)
-        out_f = self.weight.size(0)
-        x2d   = x.reshape(-1, in_f).contiguous()      # [M, in_f]
-        Wt    = self.weight.t().contiguous()          # [in_f, out_f]
-        y2d   = matmul2d(x2d, Wt)                     # [M, out_f]
-        if self.bias is not None:
-            y2d = y2d + self.bias.unsqueeze(0)        # 안전 브로드캐스트
+        _bind_to_route_if_possible()
+        dev = x.device
+        W = self.weight.to(dev, non_blocking=True)
+        b = self.bias.to(dev, non_blocking=True) if self.bias is not None else None
+
+        in_f  = W.size(1)
+        out_f = W.size(0)
+
+        x2d = x.reshape(-1, in_f).contiguous()
+        Wt  = W.t().contiguous()
+
+        y2d = matmul2d(x2d, Wt)
+        if b is not None:
+            y2d = y2d + b.unsqueeze(0)
+
         return y2d.reshape(*x.shape[:-1], out_f)
