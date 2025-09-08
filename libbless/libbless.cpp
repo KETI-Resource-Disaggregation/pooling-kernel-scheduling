@@ -111,15 +111,25 @@ static inline void master_send(const char* msg) {
 }
 
 // push/pop current context according to **route only** (boost는 경로에 영향 X)
-struct ScopedRoute {
-  explicit ScopedRoute(int override_route = -1) {
+// 현재 컨텍스트와 목표 컨텍스트가 같으면 push/pop 자체를 생략 → 핫패스 오버헤드 절감
+struct ScopedCtxGuard {
+  CUcontext target{nullptr};
+  bool pushed{false};
+  explicit ScopedCtxGuard(int override_route = -1) {
     ensure_init();
-    int base = bless::route.load(std::memory_order_acquire);
+    int base = bless::route.load(std::memory_order_relaxed);
     int r = (override_route >= 0) ? override_route : base;
-    CUcontext target = (r==bless::UNLIMITED) ? bless::ctx_unlimited : bless::ctx_limited;
-    cuCtxPushCurrent(target);
+    target = (r==bless::UNLIMITED) ? bless::ctx_unlimited : bless::ctx_limited;
+    CUcontext cur=nullptr;
+    cuCtxGetCurrent(&cur);
+    if (cur != target) {
+      cuCtxPushCurrent(target);
+      pushed = true;
+    }
   }
-  ~ScopedRoute(){ CUcontext p=nullptr; cuCtxPopCurrent(&p); }
+  ~ScopedCtxGuard(){
+    if (pushed) { CUcontext p=nullptr; cuCtxPopCurrent(&p); }
+  }
 };
 
 static std::atomic<bool> rt_attached{false};
@@ -353,7 +363,8 @@ static inline void kernel_credit_gate() {
     // 잠깐 양보 → 과도 시 짧게 sleep
     if (waited < 50) { ++waited; sched_yield(); }
     else {
-      struct timespec ts{0, 100000}; /* 100µs */
+      // 100µs → 20µs로 낮춰 스케줄링 스파이크 완화
+      struct timespec ts{0, 20000}; /* 20µs */
       nanosleep(&ts, nullptr);
       waited = 0;
     }
@@ -369,7 +380,7 @@ extern "C" cudaError_t cudaLaunchKernel(const void *hostFunc,
                                         void **args, size_t sharedMem,
                                         cudaStream_t stream)
 {
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
 
   // reconf gate / pause
   if (bless::route.load()==bless::LIMITED) {
@@ -399,7 +410,7 @@ extern "C" cudaError_t cudaLaunchKernel(const void *hostFunc,
     }
   }
 
-  ScopedRoute s; // route만 고려 (boost는 경로에 영향 X)
+  ScopedCtxGuard s; // route만 고려 (boost는 경로에 영향 X)
   return real_cudaLaunchKernel(hostFunc, gridDim, blockDim, args, sharedMem, stream);
 }
 
@@ -410,7 +421,7 @@ extern "C" CUresult cuLaunchKernel(CUfunction f,
                                    CUstream hStream,
                                    void **kernelParams, void **extra)
 {
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
 
   if (bless::route.load()==bless::LIMITED) {
     int g = bless::gate.load(std::memory_order_acquire);
@@ -437,7 +448,7 @@ extern "C" CUresult cuLaunchKernel(CUfunction f,
     }
   }
 
-  ScopedRoute s;
+  ScopedCtxGuard s;
   return real_cuLaunchKernel(f, gridX, gridY, gridZ,
                              blockX, blockY, blockZ,
                              sharedMemBytes, hStream, kernelParams, extra);
@@ -445,12 +456,12 @@ extern "C" CUresult cuLaunchKernel(CUfunction f,
 
 // alloc/mem/stream/graph/sync pass-throughs
 extern "C" cudaError_t cudaMalloc(void **p, size_t n){
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
   bless::any_alloc.store(true, std::memory_order_release);
-  ScopedRoute s; return real_cudaMalloc(p,n);
+  ScopedCtxGuard s; return real_cudaMalloc(p,n);
 }
 extern "C" cudaError_t cudaFree(void *devPtr){
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
   CUcontext owner=nullptr;
   CUresult r=cuPointerGetAttribute(&owner, CU_POINTER_ATTRIBUTE_CONTEXT, (CUdeviceptr)devPtr);
   if (r==CUDA_SUCCESS && owner){
@@ -458,50 +469,50 @@ extern "C" cudaError_t cudaFree(void *devPtr){
     cudaError_t e=real_cudaFree(devPtr);
     cuCtxPopCurrent(&prev); return e;
   }
-  ScopedRoute s; return real_cudaFree(devPtr);
+  ScopedCtxGuard s; return real_cudaFree(devPtr);
 }
 extern "C" cudaError_t cudaMallocManaged(void **p, size_t n, unsigned int f){
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
   bless::any_alloc.store(true, std::memory_order_release);
-  ScopedRoute s; return real_cudaMallocManaged(p,n,f);
+  ScopedCtxGuard s; return real_cudaMallocManaged(p,n,f);
 }
 extern "C" cudaError_t cudaMemcpy(void *d,const void *s,size_t c,cudaMemcpyKind k){
-  resolve_real(); ensure_init(); return real_cudaMemcpy(d,s,c,k);
+  ensure_init(); return real_cudaMemcpy(d,s,c,k);
 }
 extern "C" cudaError_t cudaMemcpyAsync(void *d,const void *s,size_t c,cudaMemcpyKind k,cudaStream_t st){
-  resolve_real(); ensure_init(); return real_cudaMemcpyAsync(d,s,c,k,st);
+  ensure_init(); return real_cudaMemcpyAsync(d,s,c,k,st);
 }
 extern "C" cudaError_t cudaStreamCreate(cudaStream_t *st){
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
   return real_cudaStreamCreate(st);
 }
 extern "C" cudaError_t cudaStreamDestroy(cudaStream_t st){
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
   return real_cudaStreamDestroy(st);
 }
 extern "C" cudaError_t cudaGraphLaunch(cudaGraphExec_t g, cudaStream_t st){
-  resolve_real(); ensure_init(); return real_cudaGraphLaunch(g, st);
+  ensure_init(); return real_cudaGraphLaunch(g, st);
 }
 extern "C" cudaError_t cudaDeviceSynchronize(){
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
   return real_cudaDeviceSynchronize();
 }
 extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t st){
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
   return real_cudaStreamSynchronize(st);
 }
 
 // queries / helpers
 extern "C" __attribute__((visibility("default"))) int bless_query_sm_affinity(){
-  resolve_real(); ensure_init();
-  ScopedRoute s;
+  ensure_init();
+  ScopedCtxGuard s;
   CUexecAffinityParam q{}; q.type=CU_EXEC_AFFINITY_TYPE_SM_COUNT;
   if (cuCtxGetExecAffinity(&q, CU_EXEC_AFFINITY_TYPE_SM_COUNT)==CUDA_SUCCESS) return (int)q.param.smCount.val;
   return -1;
 }
 extern "C" __attribute__((visibility("default")))
 void bless_bind_thread(int route) {
-  resolve_real(); ensure_init(); attach_runtime_if_needed();
+  ensure_init(); attach_runtime_if_needed();
   int r = (route==1) ? bless::UNLIMITED : bless::LIMITED;
   // any_alloc 이후 route 전환은 무시되므로, 여기서는 "설정된 route"로만 바인딩
   CUcontext target = (r==bless::UNLIMITED) ? bless::ctx_unlimited : bless::ctx_limited;
