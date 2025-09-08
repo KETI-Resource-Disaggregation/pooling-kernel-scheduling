@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, time, csv, argparse, warnings, math, random, socket
+import os, sys, time, csv, argparse, warnings, math, random, socket, json
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SYSROOT = os.path.dirname(_HERE)
 if _HERE not in sys.path: sys.path.insert(0, _HERE)
@@ -16,6 +16,10 @@ import torch.nn.functional as F
 
 MASTER = os.environ.get("BLESS_MASTER", "/tmp/bless-master.sock")
 TENANT = os.environ.get("BLESS_TENANT", "")
+API_ADDR = os.environ.get("API_ADDR", "127.0.0.1")
+API_PORT = int(os.environ.get("API_PORT", "6060"))
+TELEM_PERIOD_S = float(os.environ.get("TELEM_PERIOD_S", "1.0"))
+HTTP_TIMEOUT = float(os.environ.get("TELEM_HTTP_TIMEOUT", "0.05"))
 
 def send_master(msg: str):
     if not MASTER: return
@@ -38,7 +42,6 @@ except Exception:
     _bind = None; _curr = None
 
 def bind_to_current_route():
-    """현재 설정된 route(LIMITED/UNLIMITED)에 스레드를 바인딩."""
     if _bind and _curr:
         try:
             r = int(_curr())
@@ -53,7 +56,7 @@ def _aten_warm_ops():
     y = torch.tanh(x) + torch.sin(x)
     _ = y.sum().item()
 
-# 안전 옵션 (환경변수로 덮을 수 있음)
+# 안전 옵션
 os.environ.setdefault("BLESS_LINEAR", "cutlass")
 os.environ.setdefault("BLESS_SAFE_GEMM", "1")
 if os.environ.get("ANOMALY", "0") == "1":
@@ -172,10 +175,57 @@ def build_model(model_name, vocab, d_model, n_layer, n_head, seq, ff_mult):
         raise ValueError(model_name)
     return m.train()
 
-def _one_step(model, opt, args):
-    """한 스텝을 수행하고 (loss, tok_per_s) 반환. 실패 시 None."""
+# ---- Telemetry Agent ----
+import http.client
+class TelemetryAgent:
+    def __init__(self, tenant:str, period_s:float=1.0, host:str="127.0.0.1", port:int=6060, timeout:float=0.05):
+        self.tenant = tenant or ""
+        self.period = max(0.1, period_s)
+        self.host = host; self.port = port; self.timeout = timeout
+        self.last_send = time.time()
+        self.lat_hist = []  # recent step durations (s)
+        self.lat_hist_max = 20
+        self.qps_ema = None
+        self.alpha = 0.3
+    def push_step(self, dt_s: float, tok_per_s: float|None):
+        self.lat_hist.append(dt_s); 
+        if len(self.lat_hist) > self.lat_hist_max: self.lat_hist.pop(0)
+        inst_qps = 0.0 if dt_s<=0 else 1.0/dt_s
+        self.qps_ema = inst_qps if self.qps_ema is None else (self.alpha*inst_qps + (1-self.alpha)*self.qps_ema)
+        now = time.time()
+        if now - self.last_send >= self.period:
+            self.send(tok_per_s)
+            self.last_send = now
+    def _p90_ms(self):
+        if not self.lat_hist: return None
+        s = sorted(self.lat_hist)
+        i = int(round(0.9*(len(s)-1)))
+        i = max(0, min(len(s)-1, i))
+        return s[i]*1000.0
+    def send(self, tok_per_s: float|None):
+        if not self.tenant: return
+        body = {
+            "tenant": self.tenant,
+            "qps": float(self.qps_ema) if self.qps_ema is not None else None,
+            "lat_p90": float(self._p90_ms()) if self._p90_ms() is not None else None,
+            "tok_per_s": float(tok_per_s) if tok_per_s is not None else None,
+            "imgs_per_s": None
+        }
+        try:
+            conn = http.client.HTTPConnection(API_ADDR, API_PORT, timeout=HTTP_TIMEOUT)
+            conn.request("POST", "/telemetry", body=json.dumps(body), headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            try:
+                _ = resp.read()
+            finally:
+                resp.close()
+            conn.close()
+        except Exception:
+            pass
+
+def _one_step(model, opt, args, ta: TelemetryAgent | None):
+    """한 스텝 수행 -> (loss, tok_per_s). 실패 시 None."""
     bind_to_current_route()
-    # 입력
     x = torch.randint(0, args.vocab, (args.batch, args.seq), device="cuda", dtype=torch.long)
     y = torch.randint(0, args.vocab, (args.batch, args.seq), device="cuda", dtype=torch.long)
 
@@ -211,6 +261,7 @@ def _one_step(model, opt, args):
 
     dt = max(1e-6, time.time() - tic)
     tps = (args.batch * args.seq) / dt
+    if ta: ta.push_step(dt, tps)
     return (float(loss.item()), float(tps))
 
 def run(args):
@@ -221,6 +272,8 @@ def run(args):
     run_name = os.environ.get("RUNNER_NAME") or (tenant if tenant else f"{args.model}-{os.getpid()}-{time.strftime('%m%d-%H%M%S')}")
     csv_path = f"{run_name}.csv"
     print(f"[{run_name}] csv opened -> {csv_path}", flush=True)
+    dname = os.path.dirname(csv_path)
+    if dname: os.makedirs(dname, exist_ok=True)
     f = open(csv_path, "w", newline="", buffering=1)
     w = csv.writer(f); w.writerow(["t_s","step","loss","tok_per_s"]); f.flush(); os.fsync(f.fileno())
 
@@ -229,7 +282,7 @@ def run(args):
     _aten_warm_ops()
     torch.cuda.set_device(0)
 
-    # 모델 초기화 (CPU -> GPU 이동)
+    # 모델 초기화
     model = build_model(args.model, args.vocab, args.d_model, args.n_layer, args.n_head, args.seq, args.ff_mult).cpu()
     def _init_small(m):
         if isinstance(m, nn.Linear):
@@ -243,21 +296,22 @@ def run(args):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9,0.95), weight_decay=0.01, foreach=False, fused=False)
     torch.cuda.synchronize(); torch.cuda._sleep(1000)
 
-    # ==== 워밍업(시간 기반) ====
+    ta = TelemetryAgent(tenant=tenant, period_s=TELEM_PERIOD_S, host=API_ADDR, port=API_PORT, timeout=HTTP_TIMEOUT)
+
+    # 워밍업
     if args.warmup_s > 0:
         print(f"[{run_name}] warmup_s={args.warmup_s}", flush=True)
         t_warm_end = time.time() + args.warmup_s
         while time.time() < t_warm_end:
-            _ = _one_step(model, opt, args)
-
-    # ==== 메인 루프: duration_s > 0 이면 시간 기반, 아니면 steps 기반 ====
+            _ = _one_step(model, opt, args, ta)
+    # 메인
     t0 = time.time()
     step = 0
     if args.duration_s > 0:
         t_end = t0 + args.duration_s
         while time.time() < t_end:
             step += 1
-            out = _one_step(model, opt, args)
+            out = _one_step(model, opt, args, ta)
             if out is None: 
                 continue
             loss, tps = out
@@ -267,7 +321,7 @@ def run(args):
                 print(f"[{run_name}] step={step} tok/s={tps:.0f}", flush=True)
     else:
         for step in range(1, args.steps+1):
-            out = _one_step(model, opt, args)
+            out = _one_step(model, opt, args, ta)
             if out is None:
                 continue
             loss, tps = out
@@ -282,14 +336,9 @@ def run(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", choices=["gpt2","bert"], required=True)
-    # 시간 기반 실행(초). 0이면 스텝 기반.
-    ap.add_argument("--duration_s", type=float, default=0.0, help=">0이면 시간 기반 실행 (초)")
-    ap.add_argument("--warmup_s",   type=float, default=0.0, help=">0이면 워밍업 (초)")
-
-    # 스텝 기반 기본값
+    ap.add_argument("--duration_s", type=float, default=0.0)
+    ap.add_argument("--warmup_s",   type=float, default=0.0)
     ap.add_argument("--steps", type=int, default=200)
-
-    # 모델/데이터 스펙
     ap.add_argument("--batch", type=int, default=12)
     ap.add_argument("--seq",   type=int, default=384)
     ap.add_argument("--vocab", type=int, default=4096)
