@@ -1,17 +1,39 @@
-import os, time, csv, argparse
+#!/usr/bin/env python3
+import os, time, csv, argparse, socket, json
 import torch
 import torch.nn as nn
 import torchvision.models as tvm
+import http.client
+from typing import Optional
+
+MASTER = os.environ.get("BLESS_MASTER", "/tmp/bless-master.sock")
+TENANT = os.environ.get("BLESS_TENANT", "")
+API_ADDR = os.environ.get("API_ADDR", "127.0.0.1")
+API_PORT = int(os.environ.get("API_PORT", "6060"))
+TELEM_PERIOD_S = float(os.environ.get("TELEM_PERIOD_S", "1.0"))
+HTTP_TIMEOUT = float(os.environ.get("TELEM_HTTP_TIMEOUT", "0.05"))
+
+# bless bind helpers
+import ctypes
+try:
+    _lib = ctypes.CDLL(None)
+    _bind = getattr(_lib, "bless_bind_thread"); _bind.argtypes=[ctypes.c_int]; _bind.restype=None
+    _curr = getattr(_lib, "bless_current_route"); _curr.restype=ctypes.c_int
+except Exception:
+    _bind = None; _curr = None
+
+def bind_to_current_route():
+    if _bind and _curr:
+        try:
+            r = int(_curr())
+            _bind(1 if r==1 else 0)
+        except Exception:
+            pass
 
 def assert_heads(d_model: int, n_head: int):
     assert d_model % n_head == 0, f"d_model({d_model}) must be divisible by n_head({n_head})"
 
 def resolve_vocab(model: str, vocab_arg: int, reserve_arg: int):
-    """
-    Returns (num_embeddings, reserve_effective).
-    - GPT2 : num_embeddings=vocab(default 50257), reserve=0
-    - BERT : num_embeddings=vocab+reserve(default 30522+3), reserve>=2([CLS],[SEP])
-    """
     if model == "gpt2":
         vocab = vocab_arg if vocab_arg > 0 else 50257
         return vocab, 0
@@ -95,6 +117,62 @@ def make_inputs(args):
     x = torch.randn(args.batch, 3, args.img, args.img, device="cuda")
     return (x,)
 
+# ---- Telemetry Agent for inference ----
+class TelemetryAgent:
+    def __init__(self, tenant:str, period_s:float=1.0, host:str="127.0.0.1", port:int=6060, timeout:float=0.05):
+        self.tenant = tenant or ""
+        self.period = max(0.1, period_s)
+        self.host = host; self.port = port; self.timeout = timeout
+        self.last_send = time.time()
+        self.lat_hist = []  # per-request latency (s)
+        self.lat_hist_max = 40
+        self.qps_ema = None
+        self.alpha = 0.3
+        self.last_req_ts = None
+        self.last_tokps = 0.0
+        self.last_imgps = 0.0
+    def push_req(self, lat_s: float, tokps: float, imgps: float):
+        self.lat_hist.append(lat_s); 
+        if len(self.lat_hist) > self.lat_hist_max: self.lat_hist.pop(0)
+        now = time.time()
+        if self.last_req_ts is None: self.last_req_ts = now
+        dt = max(1e-6, now - self.last_req_ts)
+        inst_qps = 1.0/dt
+        self.qps_ema = inst_qps if self.qps_ema is None else (self.alpha*inst_qps + (1-self.alpha)*self.qps_ema)
+        self.last_req_ts = now
+        self.last_tokps = tokps; self.last_imgps = imgps
+        if now - self.last_send >= self.period:
+            self.send()
+            self.last_send = now
+    def _p90_ms(self):
+        if not self.lat_hist: return None
+        s = sorted(self.lat_hist)
+        i = int(round(0.9*(len(s)-1)))
+        i = max(0, min(len(s)-1, i))
+        return s[i]*1000.0
+    def send(self):
+        if not self.tenant: return
+        body = {
+            "tenant": self.tenant,
+            "qps": float(self.qps_ema) if self.qps_ema is not None else None,
+            "lat_p90": float(self._p90_ms()) if self._p90_ms() is not None else None,
+            "tok_per_s": float(self.last_tokps),
+            "imgs_per_s": float(self.last_imgps)
+        }
+        try:
+            conn = http.client.HTTPConnection(API_ADDR, API_PORT, timeout=HTTP_TIMEOUT)
+            conn.request("POST", "/telemetry", body=json.dumps(body), headers={"Content-Type": "application/json"})
+            # >>> 응답을 반드시 소비! (안 하면 BrokenPipe)
+            resp = conn.getresponse()
+            try:
+                _ = resp.read()
+            finally:
+                resp.close()
+            conn.close()
+        except Exception:
+        # 텔레메트리는 베스트에포트: 조용히 무시
+            pass
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, choices=["gpt2","bert","resnet50","resnet101"])
@@ -123,7 +201,9 @@ def main():
 
     model = build_model(args)
     inp = make_inputs(args)
+    bind_to_current_route()
 
+    # Warmup
     if args.warmup_s and args.warmup_s > 0:
         t0w = time.time()
         while time.time() - t0w < args.warmup_s:
@@ -148,38 +228,33 @@ def main():
     pace_s = args.pace_ms/1000.0 if args.pace_ms and args.pace_ms > 0 else 0.0
     next_deadline = time.time()
 
+    ta = TelemetryAgent(tenant=TENANT, period_s=TELEM_PERIOD_S, host=API_ADDR, port=API_PORT, timeout=HTTP_TIMEOUT)
+
+    def one_iter(req_id:int):
+        nonlocal t_last, next_deadline
+        if pace_s > 0:
+            now = time.time()
+            if now < next_deadline: time.sleep(next_deadline - now)
+        t0 = time.time()
+        with torch.no_grad():
+            _ = model(*inp); torch.cuda.synchronize()
+        t1 = time.time()
+        lat_ms = (t1 - t0) * 1000.0
+        dt = max(1e-6, t1 - t_last); qps = 1.0/dt; t_last = t1
+        tokps = (args.batch*args.seq) / (lat_ms/1000.0) if args.model in ("gpt2","bert") else 0.0
+        imgps = (args.batch) / (lat_ms/1000.0) if args.model.startswith("resnet") else 0.0
+        w.writerow([req_id, f"{t1:.6f}", f"{lat_ms:.3f}", f"{qps:.3f}", f"{tokps:.3f}", f"{imgps:.3f}"])
+        ta.push_req(lat_ms/1000.0, tokps, imgps)
+        if pace_s > 0: next_deadline = t0 + pace_s
+
     if use_time_mode:
         t_end = time.time() + args.duration_s
         while time.time() < t_end:
-            if pace_s > 0:
-                now = time.time()
-                if now < next_deadline: time.sleep(next_deadline - now)
-            t0 = time.time()
-            with torch.no_grad():
-                _ = model(*inp); torch.cuda.synchronize()
-            t1 = time.time()
             req_id += 1
-            lat_ms = (t1 - t0) * 1000.0
-            dt = max(1e-6, t1 - t_last); qps = 1.0/dt; t_last = t1
-            tokps = (args.batch*args.seq) / (lat_ms/1000.0) if args.model in ("gpt2","bert") else 0.0
-            imgps = (args.batch) / (lat_ms/1000.0) if args.model.startswith("resnet") else 0.0
-            w.writerow([req_id, f"{t1:.6f}", f"{lat_ms:.3f}", f"{qps:.3f}", f"{tokps:.3f}", f"{imgps:.3f}"])
-            if pace_s > 0: next_deadline = t0 + pace_s
+            one_iter(req_id)
     else:
         for i in range(1, args.n_reqs+1):
-            if pace_s > 0:
-                now = time.time()
-                if now < next_deadline: time.sleep(next_deadline - now)
-            t0 = time.time()
-            with torch.no_grad():
-                _ = model(*inp); torch.cuda.synchronize()
-            t1 = time.time()
-            lat_ms = (t1 - t0) * 1000.0
-            dt = max(1e-6, t1 - t_last); qps = 1.0/dt; t_last = t1
-            tokps = (args.batch*args.seq) / (lat_ms/1000.0) if args.model in ("gpt2","bert") else 0.0
-            imgps = (args.batch) / (lat_ms/1000.0) if args.model.startswith("resnet") else 0.0
-            w.writerow([i, f"{t1:.6f}", f"{lat_ms:.3f}", f"{qps:.3f}", f"{tokps:.3f}", f"{imgps:.3f}"])
-            if pace_s > 0: next_deadline = t0 + pace_s
+            one_iter(i)
 
     f.close()
 
