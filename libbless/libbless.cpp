@@ -16,16 +16,14 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <sched.h>
-#include <time.h>  // nanosleep
+#include <time.h>
 
-// fwd
 static void ensure_init();
 static void attach_runtime_if_needed();
 static void start_control_server(const std::string& path);
 
 namespace bless { static std::atomic<int> gate{0}; }
 
-// ---------------- real runtime symbols ----------------
 static decltype(&cudaLaunchKernel)  real_cudaLaunchKernel  = nullptr;
 static decltype(&cuLaunchKernel)    real_cuLaunchKernel    = nullptr;
 static decltype(&cudaMalloc)        real_cudaMalloc        = nullptr;
@@ -56,11 +54,10 @@ static void resolve_real() {
     real_cudaStreamSynchronize = (decltype(&cudaStreamSynchronize)) dlsym(RTLD_NEXT, "cudaStreamSynchronize");
 }
 
-// ---------------- bless state ----------------
 namespace bless {
   enum Route { LIMITED=0, UNLIMITED=1 };
 
-  static std::atomic<int>  route{LIMITED};       // 런타임 중 전환 금지(할당 이후엔 무시)
+  static std::atomic<int>  route{LIMITED}; 
   static std::atomic<bool> inited{false};
   static pthread_mutex_t   init_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -77,32 +74,25 @@ namespace bless {
   static int total_sms = 0;
   static std::atomic<int> limited_sms{0};
 
-  // squad accounting
-  static std::atomic<int>        squad_size{100};   // set_squad
+  static std::atomic<int>        squad_size{100}; 
   static std::atomic<int>        squad_prog{0};
   static std::atomic<long long>  kernel_seq{0};
 
-  // boost는 "크레딧 게이트 우회" 의미로만 사용 (컨텍스트 전환 X)
   static std::atomic<bool> boost_mode{false};
   static std::atomic<bool> pause_mode{false};
 
-  // share & SD
   static std::atomic<int>  share_quota{0};
   static std::atomic<int>  sd_sent{0};
 
-  // 크레딧 게이트: -1이면 무제한(게이트 off), 0..N은 남은 커널 크레딧
   static std::atomic<int>  credit_remain{-1};
 
-  // any GPU allocation happened? (guard reconf/route)
   static std::atomic<bool> any_alloc{false};
 
-  // optional master
   static int master_fd = -1;
   static std::string master_path;
   static std::string tenant_id;
 }
 
-// ---- master send ----
 static inline void master_send(const char* msg) {
   if (bless::master_fd < 0 || bless::master_path.empty()) return;
   sockaddr_un r{}; r.sun_family = AF_UNIX;
@@ -110,8 +100,6 @@ static inline void master_send(const char* msg) {
   sendto(bless::master_fd, msg, (int)strlen(msg), 0, (sockaddr*)&r, sizeof(r));
 }
 
-// push/pop current context according to **route only** (boost는 경로에 영향 X)
-// 현재 컨텍스트와 목표 컨텍스트가 같으면 push/pop 자체를 생략 → 핫패스 오버헤드 절감
 struct ScopedCtxGuard {
   CUcontext target{nullptr};
   bool pushed{false};
@@ -144,11 +132,9 @@ static void attach_runtime_if_needed() {
       void* h = dlopen("libcudart.so", RTLD_LAZY | RTLD_GLOBAL); (void)h; resolve_real();
     }
     CUcontext prev=nullptr;
-    // attach to LIMITED
     cuCtxPushCurrent(bless::ctx_limited);
     if (real_cudaFree) real_cudaFree(0);
     cuCtxPopCurrent(&prev);
-    // attach to UNLIMITED
     cuCtxPushCurrent(bless::ctx_unlimited);
     if (real_cudaFree) real_cudaFree(0);
     cuCtxPopCurrent(&prev);
@@ -157,7 +143,6 @@ static void attach_runtime_if_needed() {
   pthread_mutex_unlock(&rt_mu);
 }
 
-// safe (re)create LIMITED only if no allocations yet
 static void reconf_limited_ctx(int new_sms) {
   if (bless::any_alloc.load(std::memory_order_acquire)) {
     fprintf(stderr, "[libbless] reconf_sm ignored: allocations already exist\n");
@@ -193,7 +178,6 @@ static void ensure_init() {
   if (init_sms < 1) init_sms = 1;
   bless::limited_sms.store(init_sms);
 
-  // UNLIMITED ctx
   (void)cuCtxCreate_v3(&bless::ctx_unlimited, nullptr, 0, 0, bless::dev);
   { CUcontext prev=nullptr; cuCtxPushCurrent(bless::ctx_unlimited);
     CUexecAffinityParam q{}; q.type = CU_EXEC_AFFINITY_TYPE_SM_COUNT;
@@ -202,21 +186,16 @@ static void ensure_init() {
     cuCtxPopCurrent(&prev);
   }
 
-  // LIMITED ctx
   reconf_limited_ctx(init_sms);
 
-  // control socket
   char sp[128]; snprintf(sp, sizeof(sp), "/tmp/bless-%d.sock", (int)getpid());
   bless::sock_path = sp;
   start_control_server(bless::sock_path);
 
-  // wait ready
   for (int i=0;i<60 && !bless::ctrl_ready.load();++i) { usleep(50*1000); }
 
-  // attach cudart upfront
   attach_runtime_if_needed();
 
-  // optional master
   if (const char* mp = getenv("BLESS_MASTER")) {
     bless::master_path = mp;
     bless::master_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -257,7 +236,6 @@ static void start_control_server(const std::string& path) {
       if (n < 0) continue;
       buf[n]=0;
 
-      // -------- route/boost/pause ----------
       if (!strncmp(buf,"limited",7)) {
         if (!bless::any_alloc.load()) bless::route.store(bless::LIMITED);
       }
@@ -293,7 +271,6 @@ static void start_control_server(const std::string& path) {
         }
       }
 
-      // -------- squad/share ----------
       else if (!strncmp(buf,"set_squad ",10)){
         int k = atoi(buf+10); if (k>0){ bless::squad_size.store(k); }
       }
@@ -309,7 +286,6 @@ static void start_control_server(const std::string& path) {
         bless::sd_sent.store(0);
       }
 
-      // -------- credit gate ----------
       else if (!strncmp(buf,"credit_set ",11)) {
         int q = atoi(buf+11);
         bless::credit_remain.store(q, std::memory_order_release);
@@ -318,7 +294,6 @@ static void start_control_server(const std::string& path) {
         bless::credit_remain.store(-1, std::memory_order_release);
       }
 
-      // -------- reconf ----------
       else if (!strncmp(buf,"reconf_sm ",10)) {
         int k = atoi(buf+10); if (k>0) reconf_limited_ctx(k);
       }
@@ -336,13 +311,11 @@ static void start_control_server(const std::string& path) {
   });
 }
 
-// --------- credit gate (경량/버스트 캐시) ----------
 static inline void kernel_credit_gate() {
-  // boost 시에는 게이트 우회
   if (__builtin_expect(bless::boost_mode.load(std::memory_order_relaxed), 0)) return;
 
   int cr = bless::credit_remain.load(std::memory_order_relaxed);
-  if (__builtin_expect(cr < 0, 1)) return; // 무제한
+  if (__builtin_expect(cr < 0, 1)) return; 
 
   static thread_local int tl_burst = 0;
   if (__builtin_expect(tl_burst > 0, 1)) { --tl_burst; return; }
@@ -357,24 +330,19 @@ static inline void kernel_credit_gate() {
       tl_burst = got - 1;
       return;
     }
-    // 되돌림
     bless::credit_remain.fetch_add(BURST, std::memory_order_acq_rel);
 
-    // 잠깐 양보 → 과도 시 짧게 sleep
     if (waited < 50) { ++waited; sched_yield(); }
     else {
-      // 100µs → 20µs로 낮춰 스케줄링 스파이크 완화
-      struct timespec ts{0, 20000}; /* 20µs */
+      struct timespec ts{0, 20000};
       nanosleep(&ts, nullptr);
       waited = 0;
     }
 
-    // 무제한으로 전환되었는지 재확인
     if (bless::credit_remain.load(std::memory_order_acquire) < 0) return;
   }
 }
 
-// ------------- interceptors -------------
 extern "C" cudaError_t cudaLaunchKernel(const void *hostFunc,
                                         dim3 gridDim, dim3 blockDim,
                                         void **args, size_t sharedMem,
@@ -382,14 +350,12 @@ extern "C" cudaError_t cudaLaunchKernel(const void *hostFunc,
 {
   ensure_init(); attach_runtime_if_needed();
 
-  // reconf gate / pause
   if (bless::route.load()==bless::LIMITED) {
     int g = bless::gate.load(std::memory_order_acquire);
     if (g!=0) { while ((g = bless::gate.load(std::memory_order_acquire))!=0) sched_yield(); }
     while (bless::pause_mode.load(std::memory_order_acquire)) sched_yield();
   }
 
-  // 커널급 크레딧 게이트
   kernel_credit_gate();
 
   long long kseq = bless::kernel_seq.fetch_add(1) + 1;
@@ -398,7 +364,6 @@ extern "C" cudaError_t cudaLaunchKernel(const void *hostFunc,
     bless::squad_prog.store(0);
   }
 
-  // SD 신호
   int quota = bless::share_quota.load(std::memory_order_relaxed);
   if (quota > 0 && sp >= quota) {
     int was = bless::sd_sent.exchange(1);
@@ -410,7 +375,7 @@ extern "C" cudaError_t cudaLaunchKernel(const void *hostFunc,
     }
   }
 
-  ScopedCtxGuard s; // route만 고려 (boost는 경로에 영향 X)
+  ScopedCtxGuard s; 
   return real_cudaLaunchKernel(hostFunc, gridDim, blockDim, args, sharedMem, stream);
 }
 
@@ -454,7 +419,6 @@ extern "C" CUresult cuLaunchKernel(CUfunction f,
                              sharedMemBytes, hStream, kernelParams, extra);
 }
 
-// alloc/mem/stream/graph/sync pass-throughs
 extern "C" cudaError_t cudaMalloc(void **p, size_t n){
   ensure_init(); attach_runtime_if_needed();
   bless::any_alloc.store(true, std::memory_order_release);
@@ -502,7 +466,6 @@ extern "C" cudaError_t cudaStreamSynchronize(cudaStream_t st){
   return real_cudaStreamSynchronize(st);
 }
 
-// queries / helpers
 extern "C" __attribute__((visibility("default"))) int bless_query_sm_affinity(){
   ensure_init();
   ScopedCtxGuard s;
@@ -514,7 +477,6 @@ extern "C" __attribute__((visibility("default")))
 void bless_bind_thread(int route) {
   ensure_init(); attach_runtime_if_needed();
   int r = (route==1) ? bless::UNLIMITED : bless::LIMITED;
-  // any_alloc 이후 route 전환은 무시되므로, 여기서는 "설정된 route"로만 바인딩
   CUcontext target = (r==bless::UNLIMITED) ? bless::ctx_unlimited : bless::ctx_limited;
   CUcontext cur = nullptr;
   cuCtxGetCurrent(&cur);
@@ -540,7 +502,6 @@ extern "C" __attribute__((visibility("default"))) int bless_is_boosting(){
   return bless::boost_mode.load() ? 1 : 0;
 }
 
-// dtor
 __attribute__((destructor)) static void bless_dtor() {
   if (bless::master_fd >= 0) {
     char bye[128];
