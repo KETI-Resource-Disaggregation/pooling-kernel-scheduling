@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
-# SPARK Scheduler with Priority-aware Auto Planner (lexicographic & waterfilling)
 import os, sys, time, socket, re, json, csv, math, threading, random
 from typing import Dict, List, Optional, Tuple
 from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# ======================================================================
-# Basic I/O
-# ======================================================================
 MASTER       = os.environ.get("BLESS_MASTER", "/tmp/bless-master.sock")
 API_ADDR     = os.environ.get("API_ADDR", "127.0.0.1")
 API_PORT     = int(os.environ.get("API_PORT", "6060"))
 protocol_version = "HTTP/1.0"
-# ======================================================================
-# Scheduling knobs (env)
-# ======================================================================
 SQUAD           = int(os.environ.get("SQUAD", "10000"))
 SQUAD_TMO_S     = float(os.environ.get("SQUAD_TMO_S", "3.0"))
 EQUAL_SHARE     = os.environ.get("EQUAL_SHARE", "1") == "1"
 TICK_S          = float(os.environ.get("TICK_S", "0.006"))
 CREDIT_PER_TICK = int(os.environ.get("CREDIT_PER_TICK", "524288"))
 
-# Boost/solo/ramp
 BOOST_DEBOUNCE_S    = float(os.environ.get("BOOST_DEBOUNCE_S", "0.4"))
 ROTATE_BOOST        = os.environ.get("ROTATE_BOOST", "1") == "1"
 SOLO_UNLIMITED      = os.environ.get("SOLO_UNLIMITED", "0") == "1"
@@ -29,24 +21,21 @@ SOLO_MAX_FRACTION   = float(os.environ.get("SOLO_MAX_FRACTION", "0.6"))
 MIN_CREDIT_PER_TICK = int(os.environ.get("MIN_CREDIT_PER_TICK", "256"))
 FREED_RAMP_ALPHA    = float(os.environ.get("FREED_RAMP_ALPHA", "0.5"))
 
-# Auto-planner policy & weights
-GOAL_POLICY   = os.environ.get("GOAL_POLICY", "lexi")  # lexi | wf
-ALPHA_THR_W   = float(os.environ.get("ALPHA_THR_W", "1.0"))  # 처리량 위반 가중
-ALPHA_LAT_W   = float(os.environ.get("ALPHA_LAT_W", "1.0"))  # 지연 위반 가중
-JITTER_PCT    = float(os.environ.get("PLANNER_JITTER_PCT", "0.0"))  # 계획잡음(실험용)
+GOAL_POLICY   = os.environ.get("GOAL_POLICY", "lexi")
+ALPHA_THR_W   = float(os.environ.get("ALPHA_THR_W", "1.0"))
+ALPHA_LAT_W   = float(os.environ.get("ALPHA_LAT_W", "1.0")) 
+JITTER_PCT    = float(os.environ.get("PLANNER_JITTER_PCT", "0.0"))  
 
-# Tick adapt bounds
 TICK_MIN      = float(os.environ.get("TICK_MIN", "0.0018"))
 TICK_MAX      = float(os.environ.get("TICK_MAX", "0.0100"))
 TICK_KAPPA    = float(os.environ.get("TICK_KAPPA", "0.35"))
 
-# Priority weights (High > Med > Low)
 PRIO_W = {
     "HIGH": float(os.environ.get("PRIO_W_HIGH", "3.0")),
     "MED":  float(os.environ.get("PRIO_W_MED",  "1.0")),
     "LOW":  float(os.environ.get("PRIO_W_LOW",  "0.5")),
 }
-# Donor steal caps per priority (max fraction we can steal FROM a donor of that prio)
+
 STEAL_FRAC = {
     "HIGH": float(os.environ.get("STEAL_FRAC_HIGH", "0.30")),
     "MED":  float(os.environ.get("STEAL_FRAC_MED",  "0.60")),
@@ -64,10 +53,6 @@ def parse_base_shares(txt: str) -> Dict[str, float]:
     return out
 TARGET_W = parse_base_shares(os.environ.get("BASE_SHARES", ""))
 
-# ======================================================================
-# CSV logging (lightweight)
-# ======================================================================
-# ===== CSV 로깅 =====
 LOG_CSV = os.environ.get("SQUAD_LOG", "squad_log.csv")
 csv_f = open(LOG_CSV, "w", newline="", buffering=1)
 csv_w = csv.writer(csv_f)
@@ -79,18 +64,17 @@ def jdump(d):
 def log(ev, squad_id, tenant="", share=None, remain=None, note=""):
     csv_w.writerow([now_s(), ev, squad_id, tenant, jdump(share or {}), jdump(remain or {}), note])
 
-# ===== (NEW) 크레딧/스쿼드 타임시리즈 CSV =====
 CREDIT_TS_CSV = os.environ.get("CREDIT_CSV", "credit_timeseries.csv")
 credit_f = open(CREDIT_TS_CSV, "w", newline="", buffering=1)
 credit_w = csv.writer(credit_f)
-# type: assign | used | squad_cfg | rebase
+
 credit_w.writerow([
     "ts_s","type","tick_id","squad_id","tenant",
     "assigned","used","base_pct","boost","freed_pct",
     "tick_s","credits_per_tick"
 ])
 
-_g_tick_id = 0  # 전역 틱 카운터
+_g_tick_id = 0
 
 def clog(row_type:str, tick_id:int, squad_id:int, tenant:str,
          assigned:int|None=None, used:int|None=None,
@@ -106,9 +90,6 @@ def clog(row_type:str, tick_id:int, squad_id:int, tenant:str,
         TICK_S, CREDIT_PER_TICK
     ])
 
-# ======================================================================
-# Tenant protocol (DGRAM control)
-# ======================================================================
 HELLO_RE = re.compile(r"HELLO pid=(\d+)\s+sock=([/\w\.\-]+)\s+tenant=(\w*)")
 SD_RE    = re.compile(r"SD pid=(\d+)\s+t=(\w+)\s+sp=(\d+)\s+kseq=(\d+)")
 BYE_RE   = re.compile(r"BYE pid=(\d+)\s+t=(\w+)")
@@ -124,9 +105,6 @@ CTRL_BOOST_OFF_RE  = re.compile(r"\s*BOOST_DISABLE\s*$|^\s*BOOST_OFF\s*$")
 CTRL_CRED_OFF_RE   = re.compile(r"\s*CREDIT_OFF\s*$")
 CU_RE = re.compile(r"CU pid=(\d+)\s+t=(\w+)\s+used=(\d+)")
 
-# ======================================================================
-# Runtime state
-# ======================================================================
 class Tenant:
     __slots__ = ("pid","sock","alive")
     def __init__(self, pid:int, sock:str):
@@ -136,18 +114,16 @@ tenants: Dict[str,Tenant] = {}
 remain : Dict[str,int]   = {}
 inbox_events: deque = deque()
 
-# credit & squad state
-CUR_BASE_PCT: Dict[str, float] = {}     # current squad base%, ~sum 100
+CUR_BASE_PCT: Dict[str, float] = {} 
 CUR_FINISHED: set = set()
 CUR_BOOST: Optional[str] = None
 BOOST_ALLOWED: bool = True
-LAST_CRED_ALLOC: Dict[str, int] = {}    # last tick credit_set per tenant
+LAST_CRED_ALLOC: Dict[str, int] = {}
 
 _boost_last_change = 0.0
 _boost_last_tid    = None
 _freed_ramp        = 0.0
 
-# send cache to reduce overhead
 _snd = None
 _last_sent_credit: Dict[str,int] = {}
 
@@ -176,16 +152,12 @@ def _send_credit_once(tid: str, val: int):
     send(tenants[tid].sock, f"credit_set {val}")
     _last_sent_credit[tid] = val
 
-# ======================================================================
-# Telemetry & simple models (EMA)
-# ======================================================================
 EMA_A = float(os.environ.get("TELEM_EMA", "0.3"))
 class Tele:
     __slots__=("qps","lat_p90","tok_per_s","imgs_per_s","ts","hist")
     def __init__(self):
         self.qps=None; self.lat_p90=None; self.tok_per_s=None; self.imgs_per_s=None; self.ts=0.0
-        self.hist = deque(maxlen=8)  # (credit, lat_p90, ts)
-
+        self.hist = deque(maxlen=8) 
 TELEM: Dict[str, Tele] = {}
 
 def _ema(old: Optional[float], x: Optional[float], a=EMA_A):
@@ -213,7 +185,6 @@ def fit_latency_uv(tid: str) -> Optional[Tuple[float,float]]:
     """
     t = TELEM.get(tid)
     if not t or len(t.hist) < 2: return None
-    # find two points with distinct credits
     p2 = list(t.hist)[-1]
     p1 = None
     for k in range(len(t.hist)-2, -1, -1):
@@ -225,14 +196,10 @@ def fit_latency_uv(tid: str) -> Optional[Tuple[float,float]]:
     if abs(denom) < 1e-12: return None
     u = (L2 - L1) / denom
     v = L1 - u / c1
-    # clamp v (non-negative baseline)
     v = max(0.0, v)
     return (float(u), float(v))
 
-# ======================================================================
-# Priority map & helpers
-# ======================================================================
-PRIO: Dict[str, str] = {}  # tid-> "HIGH"|"MED"|"LOW"
+PRIO: Dict[str, str] = {}  
 def get_prio(tid:str) -> str:
     return PRIO.get(tid, "MED")
 
@@ -242,9 +209,6 @@ def prio_weight(tid:str) -> float:
 def donor_steal_frac(tid:str) -> float:
     return STEAL_FRAC.get(get_prio(tid), 0.6)
 
-# ======================================================================
-# Common helpers
-# ======================================================================
 def _norm_pct(d: Dict[str,float]) -> Dict[str,float]:
     s = sum(max(0.0, v) for v in d.values())
     if s <= 0:
@@ -310,9 +274,6 @@ def _pick_boost_target(active: List[str]) -> Optional[str]:
         return uf[(uf.index(_boost_last_tid)+1) % len(uf)]
     return max(unfinished, key=lambda k: prio_weight(k))
 
-# ======================================================================
-# Receive control & tenant events
-# ======================================================================
 def _recv_all():
     global EQUAL_SHARE, TICK_S, CREDIT_PER_TICK, BOOST_ALLOWED, CUR_BOOST
     try:
@@ -428,9 +389,6 @@ def _recv_all():
     except socket.timeout:
         pass
 
-# ======================================================================
-# Credit ticking
-# ======================================================================
 def push_credits(active: List[str], tick_id:int, squad_id:int):
     """틱마다 크레딧 분배. 솔로 폭주 억제 + freed 램핑 + 부스트 보너스."""
     global _freed_ramp
@@ -439,14 +397,12 @@ def push_credits(active: List[str], tick_id:int, squad_id:int):
     alive_unfinished = [t for t in active if t not in CUR_FINISHED]
     total = max(1, CREDIT_PER_TICK)
 
-    # ---- 혼자 남은 경우 처리 ----
     if len(alive_unfinished) == 1:
         only = alive_unfinished[0]
         if SOLO_UNLIMITED:
             for t in active:
                 n = -1 if t == only else 0
                 send(tenants[t].sock, f"credit_set {n}")
-                # assign 로그
                 clog("assign", tick_id, squad_id, t,
                      assigned=n, base_pct=CUR_BASE_PCT.get(t,0.0),
                      boost=(CUR_BOOST if CUR_BOOST==t else ""),
@@ -464,7 +420,6 @@ def push_credits(active: List[str], tick_id:int, squad_id:int):
                  boost=(CUR_BOOST if CUR_BOOST==t else ""), freed=_freed_ramp)
         return shares
 
-    # ---- 2개 이상: freed 램핑, 부스트 보너스, 가중치 ----
     freed_target = _freed_pct()
     _freed_ramp = _freed_ramp + FREED_RAMP_ALPHA * (freed_target - _freed_ramp)  # 0~100
     bonus_pool = _freed_ramp if BOOST_ALLOWED and CUR_BOOST else 0.0
@@ -480,7 +435,6 @@ def push_credits(active: List[str], tick_id:int, squad_id:int):
 
     shares = weighted_split_int_by_pct(active, total, pct_map)
 
-    # 최소 크레딧 보장(옵션)
     if MIN_CREDIT_PER_TICK > 0:
         for t in active:
             if t not in CUR_FINISHED:
@@ -493,22 +447,15 @@ def push_credits(active: List[str], tick_id:int, squad_id:int):
              boost=(CUR_BOOST if CUR_BOOST==t else ""), freed=_freed_ramp)
     return shares
 
-
-# ======================================================================
-# Planning core: requirement from goals (math model)
-# ======================================================================
 def c_req_from_goals(tid: str, g: dict, total: int) -> int:
     """ compute required credit for tenant given goals & models """
-    # minimum
     cmin = max(1, MIN_CREDIT_PER_TICK)
-    # throughput -> alpha
     thr = g.get("target_qps")
     alpha = estimate_alpha(tid)
     creq_thr = None
     if thr is not None and alpha and alpha>0:
         creq_thr = thr / alpha
 
-    # latency -> u,v
     lat_dead = g.get("deadline_ms")
     update_latency_hist(tid)
     uv = fit_latency_uv(tid)
@@ -522,21 +469,18 @@ def c_req_from_goals(tid: str, g: dict, total: int) -> int:
     for x in (creq_thr, creq_lat):
         if x is not None and math.isfinite(x):
             req = max(req, float(x))
-    # clamp (no single tenant > 90% by design)
     req = min(req, 0.9 * total)
     return int(max(cmin, math.floor(req)))
 
 def violation_score(tid: str, g: dict, c_alloc: int) -> float:
     """ estimate violation score with current models under c_alloc """
     score = 0.0
-    # throughput
     thr = g.get("target_qps")
     if thr is not None and thr>0:
         a = estimate_alpha(tid)
         if a:
             q_pred = a * c_alloc
             score += ALPHA_THR_W * max(0.0, (thr - q_pred)/thr)
-    # latency
     lat_dead = g.get("deadline_ms")
     if lat_dead is not None and lat_dead>0:
         uv = fit_latency_uv(tid)
@@ -546,24 +490,18 @@ def violation_score(tid: str, g: dict, c_alloc: int) -> float:
             score += ALPHA_LAT_W * max(0.0, (Lp - lat_dead)/lat_dead)
     return float(score)
 
-# ----------------------------------------------------------------------
-# (B1) Lexicographic priority planner
-# ----------------------------------------------------------------------
 def plan_lexi(active: List[str], goals: Dict[str,dict], total: int, base_alloc: Dict[str,int]) -> Tuple[Dict[str,int], Dict[str,float], float, Optional[str], Dict]:
     """
     Return (credits, squad_pct, tick_new, boost_target, debug)
     """
     debug = {}
-    # Step 1: required credits from goals (or floor)
     req = {}
     for t in active:
         g = goals.get(t, {})
         req[t] = c_req_from_goals(t, g, total)
 
-    # Step 2: start from base_alloc (current or min)
     desired = dict(base_alloc)
 
-    # Helper: steal from donors up to their stealable cap
     def steal(pool_from: List[str], need: int) -> Dict[str,int]:
         if need <= 0: return {}
         caps = {}
@@ -580,22 +518,18 @@ def plan_lexi(active: List[str], goals: Dict[str,dict], total: int, base_alloc: 
         for d in pool_from:
             w = caps[d] / total_cap if total_cap>0 else 0.0
             take[d] = int(min(caps[d], round(w * need)))
-        # adjust rounding
         diff = need - sum(take.values())
         if diff>0:
-            # still need more: take greedily
             for d,_cap in sorted(caps.items(), key=lambda kv: -kv[1]):
                 if diff<=0: break
                 more = min(diff, caps[d] - take.get(d,0))
                 if more>0: take[d]=take.get(d,0)+more; diff-=more
         return take
 
-    # Priority partitions
     H = [t for t in active if get_prio(t)=="HIGH"]
     M = [t for t in active if get_prio(t)=="MED"]
     L = [t for t in active if get_prio(t)=="LOW"]
 
-    # Function to satisfy a level S using donors D
     def satisfy(level: List[str], donors: List[str]):
         nonlocal desired
         need = sum(max(0, req[t]-desired[t]) for t in level)
@@ -604,33 +538,28 @@ def plan_lexi(active: List[str], goals: Dict[str,dict], total: int, base_alloc: 
         got = sum(take.values())
         for d,v in take.items():
             desired[d] -= v
-        # Distribute to level proportional to (req-desired) (or priority weight)
         remaining_need = need
         if got>0:
-            # proportion by gap
             gaps = {t: max(0, req[t]-desired[t]) for t in level}
             s = sum(gaps.values()) or 1
             for t in level:
                 add = int(round(gaps[t] * got / s))
                 desired[t] += add
                 remaining_need -= add
-        # If still lacking, distribute leftover equally within level (best effort)
         k = 0
         while remaining_need>0 and level:
             t = level[k % len(level)]
             desired[t] += 1; remaining_need -= 1; k+=1
 
-    # Order: HIGH gets from M+L, then MED from L
     satisfy(H, M+L)
     satisfy(M, L)
 
-    # Clamp to totals
     s = sum(desired.values())
     if s != total and s>0:
         scale = total / s
         for t in desired:
             desired[t] = int(max(MIN_CREDIT_PER_TICK, desired[t]*scale))
-        # fix rounding
+
         diff = total - sum(desired.values())
         keys = sorted(desired.keys(), key=lambda x: -prio_weight(x))
         i=0
@@ -640,35 +569,27 @@ def plan_lexi(active: List[str], goals: Dict[str,dict], total: int, base_alloc: 
             diff += -1 if diff>0 else 1
             i+=1
 
-    # Squad % ~= credit share
     pct = {t: 100.0*desired[t]/total for t in desired}
 
-    # Global violation score & tick adapt
     V = 0.0
     for t in active:
         V += prio_weight(t) * violation_score(t, goals.get(t,{}), desired[t])
     tick_new = max(TICK_MIN, min(TICK_MAX, TICK_S / (1.0 + TICK_KAPPA*V))) if V>0 else None
 
-    # Boost target: max weighted violation
     viol_by_t = {t: prio_weight(t)*violation_score(t, goals.get(t,{}), desired[t]) for t in active}
     bst = max(viol_by_t.keys(), key=lambda x: viol_by_t[x]) if active else None
 
     debug["req"]=req; debug["V"]=V; debug["viol"]=viol_by_t
     return desired, pct, tick_new, bst, debug
 
-# ----------------------------------------------------------------------
-# (B2) Weighted waterfilling (coarse, gradient-like)
-# ----------------------------------------------------------------------
 def plan_wf(active: List[str], goals: Dict[str,dict], total: int, base_alloc: Dict[str,int]) -> Tuple[Dict[str,int], Dict[str,float], float, Optional[str], Dict]:
     """
     Greedy allocate remaining budget by largest marginal gain (negative gradient).
     """
     debug={}
-    # start from floors (min) or base
     desired = {t: max(MIN_CREDIT_PER_TICK, base_alloc.get(t, MIN_CREDIT_PER_TICK)) for t in active}
     budget = total - sum(desired.values())
     if budget < 0:
-        # scale down proportionally but keep min
         s = sum(desired.values())
         for t in desired:
             desired[t] = int(max(MIN_CREDIT_PER_TICK, desired[t] * total / max(1,s)))
@@ -681,16 +602,13 @@ def plan_wf(active: List[str], goals: Dict[str,dict], total: int, base_alloc: Di
         g = goals.get(t, {})
         w  = prio_weight(t)
         val = 0.0
-        # throughput term
         T = g.get("target_qps")
         if T and T>0:
             a = estimate_alpha(t)
             if a:
-                # If unmet, gain ~ w*ALPHA_THR_W* a/T
                 q_pred = a*c
                 if q_pred < T:
                     val += w * ALPHA_THR_W * (a / T)
-        # latency term
         D = g.get("deadline_ms")
         if D and D>0:
             uv = fit_latency_uv(t)
@@ -698,14 +616,12 @@ def plan_wf(active: List[str], goals: Dict[str,dict], total: int, base_alloc: Di
                 u,v = uv
                 Lp = u/max(1.0,c) + v
                 if Lp > D:
-                    # d/dc (u/c) = -u/c^2, penalty scale 1/D
                     val += w * ALPHA_LAT_W * (u / (D * (c**2)))
         return val
 
-    step = max(1, total//256)  # coarse step to keep overhead small
+    step = max(1, total//256)
     iters = 0; max_iters = 4096
     while budget > 0 and iters < max_iters:
-        # pick tenant with largest marginal benefit
         t_best = None; g_best = 0.0
         for t in active:
             gval = grad(t, desired[t])
@@ -718,7 +634,6 @@ def plan_wf(active: List[str], goals: Dict[str,dict], total: int, base_alloc: Di
         budget -= add
         iters += 1
 
-    # final normalization (just in case)
     s = sum(desired.values())
     if s != total and s>0:
         scale = total / s
@@ -734,7 +649,6 @@ def plan_wf(active: List[str], goals: Dict[str,dict], total: int, base_alloc: Di
             i+=1
 
     pct = {t: 100.0*desired[t]/total for t in desired}
-    # tick & boost like lexi
     V = 0.0
     for t in active:
         V += prio_weight(t) * violation_score(t, goals.get(t,{}), desired[t])
@@ -744,9 +658,6 @@ def plan_wf(active: List[str], goals: Dict[str,dict], total: int, base_alloc: Di
     debug["iters"]=iters; debug["V"]=V; debug["viol"]=viol_by_t
     return desired, pct, tick_new, bst, debug
 
-# ======================================================================
-# Apply plan to runtime
-# ======================================================================
 def _apply_plan(plan: dict, enqueue_restart: bool=False) -> Dict:
     global TICK_S, CREDIT_PER_TICK, MIN_CREDIT_PER_TICK, EQUAL_SHARE, BOOST_ALLOWED, CUR_BOOST, TARGET_W
     applied = []
@@ -785,9 +696,6 @@ def _apply_plan(plan: dict, enqueue_restart: bool=False) -> Dict:
         inbox_events.append(("CTRL_RESTART", True)); applied.append("CTRL_RESTART")
     return {"ok": True, "applied_events": applied}
 
-# ======================================================================
-# HTTP API: /stats /telemetry /plan /goal /goals /priority /model
-# ======================================================================
 class _API(BaseHTTPRequestHandler):
     def _json(self, code:int, obj:dict):
         b = json.dumps(obj).encode()
@@ -801,7 +709,6 @@ class _API(BaseHTTPRequestHandler):
         except Exception:
             pass
         except (BrokenPipeError, ConnectionResetError):
-            # 클라이언트가 먼저 닫은 경우: 조용히 무시
             pass        
 
     def _send_to_tenant(tid: str, msg: str) -> bool:
@@ -857,7 +764,6 @@ class _API(BaseHTTPRequestHandler):
             self._json(200, res); return
 
         if self.path == "/priority":
-            # {tenant:"A", priority:"HIGH"} or {"map":{"A":"HIGH","B":"MED"}}
             mp = {}
             if "tenant" in body and "priority" in body:
                 mp[body["tenant"]] = str(body["priority"]).upper()
@@ -866,28 +772,23 @@ class _API(BaseHTTPRequestHandler):
                 if k in tenants: PRIO[k] = "HIGH" if v=="HIGH" else ("LOW" if v=="LOW" else "MED")
             self._json(200, {"ok": True, "prio": PRIO}); return
         elif self.path == "/sm":
-            # JSON: {"tenant": "A", "sm_pct": 30}
             body = self._read_json()
             tid  = body.get("tenant","").strip()
             pct  = float(body.get("sm_pct", -1))
             if not tid or pct <= 0 or pct >= 100:
                 self._json(400, {"ok":False, "err":"bad_args"}); return
             ok = _send_to_tenant(tid, f"set_limit_pct {pct}")
-            # 주의: libbless는 any_alloc 이후 무시. 여기서는 낙관적 ack + 힌트 제공
             note = "sent set_limit_pct; may be ignored if allocations already exist"
             if not ok:
                 self._json(404, {"ok":False, "err":"tenant_not_found"}); return
-            # 동적 변경 실패 시를 대비해, 동일 효과에 가까운 시간공유 보정도 같이 적용 (선택)
-            # 예: 목표 pct를 base weight로 반영
             alive = [k for k,v in tenants.items() if v.alive]
             weights = {k: (pct if k==tid else (100.0 - pct)/max(1,len(alive)-1)) for k in alive}
-            TARGET_W.clear(); TARGET_W.update(weights);  # 전역 목표 가중치 교체
+            TARGET_W.clear(); TARGET_W.update(weights);  
             inbox_events.append(("CTRL_WEIGHTS", dict(TARGET_W)))
-            _ = push_credits(alive, tick_id=_g_tick_id, squad_id=0)  # 즉시 한 틱 재분배
+            _ = push_credits(alive, tick_id=_g_tick_id, squad_id=0)  
             self._json(200, {"ok":True, "applied":True, "note":note, "weights_applied":weights}); return
 
         elif self.path == "/sm_count":
-            # JSON: {"tenant":"B","sms":20}
             body = self._read_json()
             tid  = body.get("tenant","").strip()
             sms  = int(body.get("sms",-1))
@@ -900,19 +801,16 @@ class _API(BaseHTTPRequestHandler):
             self._json(200, {"ok":True, "applied":True, "note":note}); return
 
         if self.path in ("/goal","/goals"):
-            # single or multi goals
             active = [tid for tid,info in tenants.items() if info.alive]
             if not active:
                 self._json(400, {"ok": False, "error":"no active tenants"}); return
 
-            # normalize goals dict
             goals: Dict[str,dict] = {}
             if self.path == "/goal":
                 t = body.get("tenant"); 
                 if not t: self._json(400, {"ok":False,"error":"tenant missing"}); return
                 goals[t] = {k:v for k,v in body.items() if k not in ("tenant","apply_now")}
             else:
-                # {goals: {"A":{...},"B":{...}}}
                 goals = body.get("goals") or {}
                 if not isinstance(goals, dict) or not goals:
                     self._json(400, {"ok":False,"error":"goals map missing"}); return
@@ -925,12 +823,10 @@ class _API(BaseHTTPRequestHandler):
             else:
                 credits, pct, tick_new, boost_t, dbg = plan_lexi(active, goals, total, base_alloc)
 
-            # jitter (optional)
             if JITTER_PCT > 0.0:
                 for k in credits:
                     jitter = int(credits[k] * (random.uniform(-JITTER_PCT, JITTER_PCT)))
                     credits[k] = max(MIN_CREDIT_PER_TICK, credits[k] + jitter)
-                # re-norm
                 s = sum(credits.values())
                 if s>0:
                     scale = total / s
@@ -953,9 +849,6 @@ class _API(BaseHTTPRequestHandler):
 
         self._json(404, {"error":"not found"})
 
-# ======================================================================
-# Main loop
-# ======================================================================
 def wait_tenants():
     deadline = time.time() + 30.0
     while True:
@@ -975,7 +868,7 @@ def _start_api():
 
 def main():
     global srv, inbox_events, CUR_BASE_PCT, CUR_FINISHED, CUR_BOOST, BOOST_ALLOWED, _g_tick_id
-    # 마스터 소켓 준비
+
     if os.path.exists(MASTER):
         try: os.unlink(MASTER)
         except: pass
@@ -984,7 +877,6 @@ def main():
 
     print(f"[master] listen {MASTER}  tick={TICK_S}s credits/tick={CREDIT_PER_TICK} base={TARGET_W} equal={int(EQUAL_SHARE)}", flush=True)
 
-    # 초기 대기(최초 테넌트 등장까지)
     def any_alive(): return any(t.alive for t in tenants.values())
     idle_sleep = float(os.environ.get("IDLE_SLEEP_S","0.2"))
 
@@ -994,28 +886,21 @@ def main():
     while True:
         _recv_all()
 
-        # 활성 집합
         active = [tid for tid,info in tenants.items() if info.alive]
 
-        # --- 아무도 없으면 idle 대기 ---
         if not active:
-            # 주기적으로만 trace 남기고 대기
             now = time.time()
             if now - last_tick >= max(TICK_S, 1.0):
                 last_tick = now
-                # keep-alive 느낌 로그(너무 시끄러우면 주석)
-                # print("[master] idle...", flush=True)
             time.sleep(idle_sleep)
             continue
 
-        # --- 틱 크레딧 분배 ---
         now = time.time()
         if now - last_tick >= TICK_S:
-            _ = push_credits(active)     # assign 기록 + credit_set 전송
+            _ = push_credits(active)  
             _g_tick_id += 1
             last_tick = now
 
-        # --- 새 스쿼드 시작 ---
         squad_id += 1
         CUR_FINISHED = set()
         CUR_BOOST    = None
@@ -1033,7 +918,6 @@ def main():
         while True:
             _recv_all()
 
-            # 틱 크레딧 분배(러닝 중)
             now2 = time.time()
             if now2 - last_tick >= TICK_S:
                 _ = push_credits(active)
@@ -1079,17 +963,14 @@ def main():
                     log(ev, squad_id, str(arg) if not isinstance(arg, dict) else "", start_share, remain,
                         f"TICK={TICK_S}, CRED={CREDIT_PER_TICK}, TARGET_W={TARGET_W}, base_pct={CUR_BASE_PCT}, boost_allowed={BOOST_ALLOWED}")
 
-            # 토폴로지 변경(누군가 종료) → 스쿼드 재시작
             if restart:
                 log("SQUAD_RESTART", squad_id, "", start_share, remain, "topology change")
                 break
 
-            # 모두 SD면 스쿼드 종료
             if len(CUR_FINISHED) == len(active):
                 log("SQUAD_END", squad_id, "", start_share, remain, f"boosted={CUR_BOOST}")
                 break
 
-            # 타임아웃으로 스쿼드 종료(다음 라운드)
             if time.time() - t0 > SQUAD_TMO_S:
                 log("SQUAD_END_TIMEOUT", squad_id, "", start_share, remain,
                     f"finished={sorted(list(CUR_FINISHED))},boosted={CUR_BOOST}")
