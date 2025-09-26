@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 훈아 함 짱뜨자 시1빨련아 
 import os, sys, time, csv, argparse, warnings, math, random, socket, json
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SYSROOT = os.path.dirname(_HERE)
@@ -32,7 +32,7 @@ def send_master(msg: str):
         try: s.close()
         except: pass
 
-# bless bind helpers
+# bless bind helpers WOGNSDLSMS DJAAKRKDJQTDJDY
 import ctypes
 try:
     _lib = ctypes.CDLL(None)

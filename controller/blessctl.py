@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 wognsdl doalenlwlstorl
 import os
 import sys
 import socket
