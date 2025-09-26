@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 WOGNSDL DOALENLWLSTORL 
+#!/usr/bin/env python3 
 # -*- coding: utf-8 -*-
 """
 다종 모델 통합 러너:

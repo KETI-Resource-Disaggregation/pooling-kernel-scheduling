@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import ctypes
 
-# bless bind  dnfl wognsdl doalenlwlstorl enlwufk wpqkf
+# bless bind 
 def _load_bless_symbols():
     try:
         lib = ctypes.CDLL(None)

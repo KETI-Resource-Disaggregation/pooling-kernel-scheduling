@@ -16,8 +16,6 @@ HTTP API → scheduler 제어 + 테넌트 런처
   API_KEY        : 비어있으면 인증 없음
   LD_PRELOAD     : 미지정 시 프로젝트 루트의 libbless/libbless.so를 자동 세팅
 """
-
-## wognsdk wlsWK WKdgksqjsEMwk dl@tlqkffusdk
 import os, sys, json, time, socket, re, signal, shlex
 import subprocess as sp
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -44,7 +42,7 @@ PROCS: Dict[str, Dict[str, Any]] = {}
 
 TENANT_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
-# --------------- 공용 유틸 ---------------- 8/5 14:21 wognsdk ckrhclrh dhsmsrp wjdtkdwjrdls toRlsi?
+# --------------- 공용 유틸 ---------------- 
 def _require_api_key(handler: BaseHTTPRequestHandler) -> bool:
     if not API_KEY:
         return False

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 gnsl dkrnckd wywvorhtlvsp sl doqlrk rmfjgrp tlzlemsk?
+#!/usr/bin/env python3
 import os, time, csv, argparse, socket, json
 import torch
 import torch.nn as nn
@@ -13,7 +13,7 @@ API_PORT = int(os.environ.get("API_PORT", "6060"))
 TELEM_PERIOD_S = float(os.environ.get("TELEM_PERIOD_S", "1.0"))
 HTTP_TIMEOUT = float(os.environ.get("TELEM_HTTP_TIMEOUT", "0.05"))
 
-# bless bind helpers WOGNSDL DOALENLWLSTORL
+# bless bind helpers 
 import ctypes
 try:
     _lib = ctypes.CDLL(None)
