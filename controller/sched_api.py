@@ -17,6 +17,7 @@ HTTP API → scheduler 제어 + 테넌트 런처
   LD_PRELOAD     : 미지정 시 프로젝트 루트의 libbless/libbless.so를 자동 세팅
 """
 
+## wognsdk wlsWK WKdgksqjsEMwk dl@tlqkffusdk
 import os, sys, json, time, socket, re, signal, shlex
 import subprocess as sp
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -43,7 +44,7 @@ PROCS: Dict[str, Dict[str, Any]] = {}
 
 TENANT_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
-# --------------- 공용 유틸 ----------------
+# --------------- 공용 유틸 ---------------- 8/5 14:21 wognsdk ckrhclrh dhsmsrp wjdtkdwjrdls toRlsi?
 def _require_api_key(handler: BaseHTTPRequestHandler) -> bool:
     if not API_KEY:
         return False
@@ -121,7 +122,7 @@ def launch_tenant(tenant: str, spec: Dict[str, Any]) -> Dict[str, Any]:
         # CV
         "imgsz": 224, "classes": 1000, "amp": True, "optim": "sgd"|"adamw",
         # 공통
-        "runner_name": "A",  # CSV 파일명 prefix로 사용됨
+        "runner_name": "A",  # CSV 파일명 prefix로 사용됨 
         "python": "/usr/bin/python3"     # 기본: sys.executable
       }
     """

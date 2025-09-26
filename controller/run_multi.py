@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 WOGNSDL DOALENLWLSTORL 
 # -*- coding: utf-8 -*-
 """
 다종 모델 통합 러너:
@@ -6,6 +6,8 @@
 - NLP: gpt2(tiny), bert(tiny) (내장 구현: 외부 다운로드 불필요)
 - 합성 데이터로 빠르게 학습 루프를 돌리며 CSV 로그 기록 (A.csv/B.csv/...)
 - libbless 크레딧 게이트와 충돌 없이 안전하게 동작(컨텍스트 고정+CPU init→GPU move)
+
+wognsdk wlsWK enlwlrhtlvsl? dj?
 """
 
 import os, sys, time, csv, argparse, socket, ctypes, math, random

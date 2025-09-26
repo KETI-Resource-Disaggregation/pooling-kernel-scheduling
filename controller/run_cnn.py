@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3  wognsdl dltlqkf doaldoqlenlwlstorldi
 # controller/run_cnn.py
 import os, sys, time, csv, argparse, ctypes, socket, torch, torch.nn as nn, torch.nn.functional as F
 from contextlib import nullcontext
