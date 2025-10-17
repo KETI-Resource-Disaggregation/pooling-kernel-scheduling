@@ -13,8 +13,6 @@
 - [Getting Started](#-getting-started)
 - [Configuration](#-configuration)
 - [API Reference](#-api-reference)
-- [Performance](#-performance)
-- [Troubleshooting](#-troubleshooting)
 
 ---
 
