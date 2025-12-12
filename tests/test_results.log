@@ -1,0 +1,155 @@
+
+======================================================================
+ SOFT SM PARTITIONING + WORK-CONSERVING VERIFICATION TEST
+ Timestamp: 2025-12-12 17:43:57
+======================================================================
+
+======================================================================
+ TEST 1: SM Manager Unit Tests
+======================================================================
+
+--- 1.1 Single Workload Allocation ---
+  ✓ Single COMPUTE_BOUND allocation
+      SM=75 (90.0%), time_comp=1.00x
+
+--- 1.2 Co-location SM Allocation ---
+  ✓ COMPUTE + MIXED
+      A=46 SM (55%), B=37 SM (45%) [Expected 55%/45%]
+  ✓ COMPUTE + MEMORY
+      A=50 SM (60%), B=33 SM (40%) [Expected 60%/40%]
+  ✓ COMPUTE + COMPUTE
+      A=42 SM (50%), B=42 SM (50%) [Expected 50%/50%]
+  ✓ MIXED + MIXED
+      A=42 SM (50%), B=42 SM (50%) [Expected 50%/50%]
+
+--- 1.3 Time Compensation ---
+  ✓ Time compensation for lower SM
+      A (55%): 1.00x, B (45%): 1.11x
+
+--- 1.4 Work-conserving ---
+  ✓ Work-conserving boost progression
+      Initial: 1.00x -> After idle: 1.55x -> After dealloc: 2.00x
+
+======================================================================
+ TEST 2: Scheduling Coordinator Tests
+======================================================================
+
+--- 2.1 Workload Registration ---
+  ✓ Register workload
+      Type=COMPUTE_BOUND, SM=75
+
+--- 2.2 Credit Computation ---
+  ✓ Credit allocation sums to total
+      A=473,684, B=526,315, Total=999,999 (expected 1,000,000)
+
+--- 2.3 Priority-based Credit Allocation ---
+  ✓ HIGH priority gets more credits
+      HIGH base=681,818, LOW base=318,181
+
+--- 2.4 Work-conserving Credit Boost ---
+  ✓ Credits increase when partner idle
+      B credits: 526,315 -> 678,571 (+152,256)
+
+======================================================================
+ TEST 3: Profiler Integration Tests
+======================================================================
+
+--- 3.1 Profiler Connectivity ---
+  ✓ Profiler health check
+      URL: http://localhost:7070
+
+--- 3.2 Profile Retrieval ---
+  ✓ Get profile: resnet50
+      Type=COMPUTE_BOUND, AI=85.0
+  ✓ Get profile: bert
+      Type=MIXED, AI=35.0
+  ✓ Get profile: vgg16
+      Type=COMPUTE_BOUND, AI=90.0
+  ✓ Get profile: gpt2
+      Type=MIXED, AI=28.0
+  ✓ Get profile: mobilenet
+      Type=COMPUTE_BOUND, AI=65.0
+
+--- 3.3 Co-location Recommendations ---
+  ✓ Co-location recommendation
+      Score=0.70, Recommendation=good, SM partition={'workload_a': 46, 'workload_b': 37}
+
+======================================================================
+ TEST 4: Co-location Scenario Tests
+======================================================================
+
+--- 4.1 Profiler-based Co-location Setup ---
+  ✓ COMPUTE + MIXED: resnet50 + bert
+      resnet50: COMPUTE_BOUND, SM=46 | bert: MIXED, SM=37
+  ✓ COMPUTE + COMPUTE: resnet50 + vgg16
+      resnet50: COMPUTE_BOUND, SM=42 | vgg16: COMPUTE_BOUND, SM=42
+  ✓ MIXED + MIXED: bert + gpt2
+      bert: MIXED, SM=42 | gpt2: MIXED, SM=42
+
+======================================================================
+ TEST 5: End-to-End Scenario Tests
+======================================================================
+
+--- 5.1 Full Workload Lifecycle ---
+  ✓ Full lifecycle
+      Phase 2: A=248,346, B=275,941 | Phase 3: B=331,692 (+55,751) | Phase 4: A removed, B remains
+
+--- 5.2 Multiple Workloads ---
+  ✓ 3 workloads credit distribution
+      W1(HIGH)=430,278, W2(MED)=318,725, W3(LOW)=250,996
+
+======================================================================
+ TEST 6: Implementation Verification
+======================================================================
+
+--- 6.1 SM Allocation Rules ---
+
+  SM_RATIO_BY_TYPE Configuration:
+    COMPUTE_BOUND + MEMORY_BOUND: 60% / 40%
+    MEMORY_BOUND + COMPUTE_BOUND: 40% / 60%
+    COMPUTE_BOUND + MIXED: 55% / 45%
+    MIXED + COMPUTE_BOUND: 45% / 55%
+    MEMORY_BOUND + MIXED: 45% / 55%
+    MIXED + MEMORY_BOUND: 55% / 45%
+    COMPUTE_BOUND + COMPUTE_BOUND: 50% / 50%
+    MEMORY_BOUND + MEMORY_BOUND: 50% / 50%
+    MIXED + MIXED: 50% / 50%
+
+  PRIORITY_SM_BONUS Configuration:
+    HIGH: +10%
+    MED: +0%
+    LOW: -5%
+  ✓ SM allocation rules defined
+
+--- 6.2 Time Compensation Formula ---
+
+  Compensation by SM%:
+    SM 60%: 1.00x
+    SM 50%: 1.00x
+    SM 45%: 1.11x
+    SM 40%: 1.25x
+    SM 30%: 1.67x
+    SM 20%: 2.00x
+    SM 10%: 2.00x
+  ✓ Time compensation formula verified
+
+--- 6.3 Work-conserving Boost ---
+
+  Boost progression:
+    Initial: 1.00x
+    After A idle: 1.55x
+    After A deallocate: 2.00x
+  ✓ Work-conserving boost verified
+
+======================================================================
+ FINAL SUMMARY
+======================================================================
+
+  Total Tests: 26
+  Passed:      26
+  Failed:      0
+  Skipped:     0
+
+  ✓ ALL TESTS PASSED!
+
+======================================================================

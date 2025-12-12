@@ -1,0 +1,166 @@
+{
+  "timestamp": "2025-12-12T17:43:57.059000",
+  "tests": [
+    {
+      "name": "Single COMPUTE_BOUND allocation",
+      "status": "PASS",
+      "details": "SM=75 (90.0%), time_comp=1.00x",
+      "error": ""
+    },
+    {
+      "name": "COMPUTE + MIXED",
+      "status": "PASS",
+      "details": "A=46 SM (55%), B=37 SM (45%) [Expected 55%/45%]",
+      "error": ""
+    },
+    {
+      "name": "COMPUTE + MEMORY",
+      "status": "PASS",
+      "details": "A=50 SM (60%), B=33 SM (40%) [Expected 60%/40%]",
+      "error": ""
+    },
+    {
+      "name": "COMPUTE + COMPUTE",
+      "status": "PASS",
+      "details": "A=42 SM (50%), B=42 SM (50%) [Expected 50%/50%]",
+      "error": ""
+    },
+    {
+      "name": "MIXED + MIXED",
+      "status": "PASS",
+      "details": "A=42 SM (50%), B=42 SM (50%) [Expected 50%/50%]",
+      "error": ""
+    },
+    {
+      "name": "Time compensation for lower SM",
+      "status": "PASS",
+      "details": "A (55%): 1.00x, B (45%): 1.11x",
+      "error": ""
+    },
+    {
+      "name": "Work-conserving boost progression",
+      "status": "PASS",
+      "details": "Initial: 1.00x -> After idle: 1.55x -> After dealloc: 2.00x",
+      "error": ""
+    },
+    {
+      "name": "Register workload",
+      "status": "PASS",
+      "details": "Type=COMPUTE_BOUND, SM=75",
+      "error": ""
+    },
+    {
+      "name": "Credit allocation sums to total",
+      "status": "PASS",
+      "details": "A=473,684, B=526,315, Total=999,999 (expected 1,000,000)",
+      "error": ""
+    },
+    {
+      "name": "HIGH priority gets more credits",
+      "status": "PASS",
+      "details": "HIGH base=681,818, LOW base=318,181",
+      "error": ""
+    },
+    {
+      "name": "Credits increase when partner idle",
+      "status": "PASS",
+      "details": "B credits: 526,315 -> 678,571 (+152,256)",
+      "error": ""
+    },
+    {
+      "name": "Profiler health check",
+      "status": "PASS",
+      "details": "URL: http://localhost:7070",
+      "error": ""
+    },
+    {
+      "name": "Get profile: resnet50",
+      "status": "PASS",
+      "details": "Type=COMPUTE_BOUND, AI=85.0",
+      "error": ""
+    },
+    {
+      "name": "Get profile: bert",
+      "status": "PASS",
+      "details": "Type=MIXED, AI=35.0",
+      "error": ""
+    },
+    {
+      "name": "Get profile: vgg16",
+      "status": "PASS",
+      "details": "Type=COMPUTE_BOUND, AI=90.0",
+      "error": ""
+    },
+    {
+      "name": "Get profile: gpt2",
+      "status": "PASS",
+      "details": "Type=MIXED, AI=28.0",
+      "error": ""
+    },
+    {
+      "name": "Get profile: mobilenet",
+      "status": "PASS",
+      "details": "Type=COMPUTE_BOUND, AI=65.0",
+      "error": ""
+    },
+    {
+      "name": "Co-location recommendation",
+      "status": "PASS",
+      "details": "Score=0.70, Recommendation=good, SM partition={'workload_a': 46, 'workload_b': 37}",
+      "error": ""
+    },
+    {
+      "name": "COMPUTE + MIXED: resnet50 + bert",
+      "status": "PASS",
+      "details": "resnet50: COMPUTE_BOUND, SM=46 | bert: MIXED, SM=37",
+      "error": ""
+    },
+    {
+      "name": "COMPUTE + COMPUTE: resnet50 + vgg16",
+      "status": "PASS",
+      "details": "resnet50: COMPUTE_BOUND, SM=42 | vgg16: COMPUTE_BOUND, SM=42",
+      "error": ""
+    },
+    {
+      "name": "MIXED + MIXED: bert + gpt2",
+      "status": "PASS",
+      "details": "bert: MIXED, SM=42 | gpt2: MIXED, SM=42",
+      "error": ""
+    },
+    {
+      "name": "Full lifecycle",
+      "status": "PASS",
+      "details": "Phase 2: A=248,346, B=275,941 | Phase 3: B=331,692 (+55,751) | Phase 4: A removed, B remains",
+      "error": ""
+    },
+    {
+      "name": "3 workloads credit distribution",
+      "status": "PASS",
+      "details": "W1(HIGH)=430,278, W2(MED)=318,725, W3(LOW)=250,996",
+      "error": ""
+    },
+    {
+      "name": "SM allocation rules defined",
+      "status": "PASS",
+      "details": "",
+      "error": ""
+    },
+    {
+      "name": "Time compensation formula verified",
+      "status": "PASS",
+      "details": "",
+      "error": ""
+    },
+    {
+      "name": "Work-conserving boost verified",
+      "status": "PASS",
+      "details": "",
+      "error": ""
+    }
+  ],
+  "summary": {
+    "passed": 26,
+    "failed": 0,
+    "skipped": 0
+  }
+}
