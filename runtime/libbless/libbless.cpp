@@ -31,6 +31,41 @@ static void start_control_server(const std::string& path);
 
 namespace bless { static std::atomic<int> gate{0}; }
 
+// ── ctx 생성 진입점 분기 (Exp_54 O-4) ────────────────────────────────────────
+// CUDA 13 헤더는 cuCtxCreate_v3 선언을 legacy 블록으로 숨겨 빌드가 깨진다.
+// 드라이버(libcuda)는 v3·v4 심볼을 모두 export 하므로(232 nm 실측) 컴파일 타임
+// 선언 대신 ★런타임 dlsym 으로 v4 우선/v3 폴백 — 12.9·13.1 양쪽 헤더에서 빌드,
+// 실행은 드라이버가 주는 진입점 사용. affinity 는 v4 의 CUctxCreateParams.
+// execAffinityParams 로 계승됨(13.1 cuda.h:2561 공식 확인 — 공간 노브 유지).
+typedef CUresult (*bless_ctx_v3_t)(CUcontext*, CUexecAffinityParam*, int,
+                                   unsigned int, CUdevice);
+typedef CUresult (*bless_ctx_v4_t)(CUcontext*, CUctxCreateParams*,
+                                   unsigned int, CUdevice);
+
+static CUresult bless_ctx_create(CUcontext* pctx, CUexecAffinityParam* params,
+                                 int nparams, unsigned int flags, CUdevice dev,
+                                 const char** entry_used) {
+  static bless_ctx_v4_t v4 =
+      (bless_ctx_v4_t)dlsym(RTLD_DEFAULT, "cuCtxCreate_v4");
+  static bless_ctx_v3_t v3 =
+      (bless_ctx_v3_t)dlsym(RTLD_DEFAULT, "cuCtxCreate_v3");
+  if (v4) {
+    if (entry_used) *entry_used = "v4";
+    CUctxCreateParams cp{};
+    cp.execAffinityParams = params;
+    cp.numExecAffinityParams = nparams;
+    return v4(pctx, params ? &cp : nullptr, flags, dev);
+  }
+  if (v3) {
+    if (entry_used) *entry_used = "v3";
+    return v3(pctx, params, nparams, flags, dev);
+  }
+  if (entry_used) *entry_used = "none";
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+
+
 // ---------------- real runtime symbols ----------------
 static decltype(&cudaLaunchKernel)  real_cudaLaunchKernel  = nullptr;
 static decltype(&cuLaunchKernel)    real_cuLaunchKernel    = nullptr;
@@ -380,6 +415,16 @@ struct ScopedCtxGuard {
       target = bless::ctx_unlimited;
       bless::fallback_launches.fetch_add(1, std::memory_order_relaxed);
     }
+    // [Exp_54 O-6] 공간 제한이 실제로 적용되지 않은 상태(limited ctx 생성 실패 =
+    // 무-MPS 환경)에서는 컨텍스트 전환이 아무 이득이 없다. 그런데 전환을 하면
+    // ★앱이 자기 컨텍스트에서 만든 비-default 스트림이 무효 핸들이 되어
+    // (CUDA_ERROR_INVALID_HANDLE) 멀티스트림 워크로드가 즉시 크래시한다
+    // (default stream 은 컨텍스트별 특수 핸들이라 무증상 — 그래서 단일 스트림
+    // 워크로드에서만 검증돼 온 것). 실효 없는 전환을 생략해 멀티스트림 호환을
+    // 회복한다. 시간 게이트(time_credit)는 컨텍스트와 무관하므로 영향 없음.
+    if (bless::limited_applied.load(std::memory_order_relaxed) == 0) {
+      return;   // pushed=false — 앱의 현재 컨텍스트 유지
+    }
     CUcontext cur=nullptr;
     cuCtxGetCurrent(&cur);
     if (cur != target) {
@@ -458,7 +503,9 @@ static void reconf_limited_ctx(int new_sms) {
     cuCtxDestroy(bless::ctx_limited);
   }
   CUexecAffinityParam p{}; p.type = CU_EXEC_AFFINITY_TYPE_SM_COUNT; p.param.smCount.val = new_sms;
-  CUresult rc = cuCtxCreate_v3(&bless::ctx_limited, &p, 1, 0, bless::dev);
+  const char* ctx_entry = nullptr;
+  CUresult rc = bless_ctx_create(&bless::ctx_limited, &p, 1, 0, bless::dev,
+                                 &ctx_entry);
   if (rc != CUDA_SUCCESS || bless::ctx_limited == nullptr) {
     // [Exp_41 O-3] 조용한 실패 금지: SM exec affinity 는 MPS 하에서만 지원 —
     // 생성 실패를 감지해 폴백 상태를 기록하고 명확히 경고한다.
@@ -477,8 +524,8 @@ static void reconf_limited_ctx(int new_sms) {
     cuCtxPopCurrent(&prev);
     bless::limited_applied.store(1);
     // 요청값 echo 금지 — 적용값을 조회해 함께 출력 (Exp_41)
-    fprintf(stderr, "[libbless] limited ctx applied sm_affinity=%d (verified=%d)\n",
-            new_sms, got);
+    fprintf(stderr, "[libbless] limited ctx applied sm_affinity=%d (verified=%d, entry=%s)\n",
+            new_sms, got, ctx_entry ? ctx_entry : "?");
   }
   bless::limited_sms.store(new_sms);
   bless::gate.store(0);
@@ -501,7 +548,7 @@ static void ensure_init() {
   bless::limited_sms.store(init_sms);
 
   // UNLIMITED ctx
-  (void)cuCtxCreate_v3(&bless::ctx_unlimited, nullptr, 0, 0, bless::dev);
+  (void)bless_ctx_create(&bless::ctx_unlimited, nullptr, 0, 0, bless::dev, nullptr);
   { CUcontext prev=nullptr; cuCtxPushCurrent(bless::ctx_unlimited);
     CUexecAffinityParam q{}; q.type = CU_EXEC_AFFINITY_TYPE_SM_COUNT;
     if (cuCtxGetExecAffinity(&q, CU_EXEC_AFFINITY_TYPE_SM_COUNT)==CUDA_SUCCESS)
@@ -533,6 +580,17 @@ static void ensure_init() {
       snprintf(hello, sizeof(hello), "HELLO pid=%d sock=%s tenant=%s",
                (int)getpid(), bless::sock_path.c_str(), bless::tenant_id.c_str());
       master_send(hello);
+    }
+  }
+
+  // mem quota — env 소비 (Exp_51 O-5): BLESS_MEM_QUOTA_MB 는 device-plugin 이
+  // Allocate 때 주입하는 채널(Exp_33)인데 기존에는 소켓 명령(mem_quota)만 읽어
+  // K8s 경로 전체가 무집행이었다. 소켓 명령은 이후에도 우선(런타임 재설정).
+  if (const char* q = getenv("BLESS_MEM_QUOTA_MB")) {
+    long long mb = atoll(q);
+    if (mb > 0) {
+      bless::mem_quota_bytes.store(mb * 1024LL * 1024LL, std::memory_order_release);
+      fprintf(stderr, "[libbless] mem_quota=%lld MB (env)\n", mb);
     }
   }
 
@@ -814,6 +872,14 @@ static inline void kernel_credit_gate() {
   int cr = bless::credit_remain.load(std::memory_order_relaxed);
   if (__builtin_expect(cr < 0, 1)) return; // 무제한
 
+  // [Exp_55 결정 — Fix2/Fix3 영구 기각] Exp_7 이 제안한 Fix2(청크 cur>>2)·
+  // Fix3(credit_refill 이월+cap)는 이 커널-수 경로의 정밀도 보정안이었다.
+  // 기각 근거(3): ① 제어 평면(controller feeder·device-plugin·bench)이
+  // credit_set/credit_refill 을 호출하지 않는다 — 실사용 경로는 전부 TIME 모드
+  // (time_mode 1 + time_add). ② Fix3 가 겨냥한 "덮어쓰기로 잔량 손실"은 시간
+  // 경로에 구조적으로 없다(time_add=누적, Exp_16 보강 ② 로 적자도 이월).
+  // ③ 시간 경로 정확도가 이미 목표 달성: 2:1/1:2/3:1/★10:1 오차 0.0002~0.0008
+  // (Exp_55 §Phase 1). → 보류 종결. 커널 경로를 되살릴 일이 생기면 그때 재평가.
   static thread_local int tl_burst = 0;
   if (__builtin_expect(tl_burst > 0, 1)) { --tl_burst; return; }
 
