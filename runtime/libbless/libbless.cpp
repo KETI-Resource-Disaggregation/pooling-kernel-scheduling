@@ -129,6 +129,14 @@ namespace bless {
   // [Exp_41 O-3] 공간 제한 실효 상태 — 무음 no-op 금지
   static std::atomic<int> limited_applied{0};      // 1=exec affinity 실제 적용
   static std::atomic<int> requested_pct{50};       // BLESS_LIMIT_PCT 요청값
+  // [Exp_61] 공간 제한 위임 방식 (BLESS_SPACE_MODE=ctx|mps_env)
+  //   SPACE_CTX     : exec-affinity 제한 컨텍스트 (현행 기본 — 하위호환)
+  //   SPACE_MPS_ENV : MPS 가 CUDA_MPS_ACTIVE_THREAD_PERCENTAGE 를 직접 해석.
+  //                   libbless 는 제한 ctx 를 만들지 않고 ctx 전환도 하지 않는다
+  //                   → O-6b(별도 스레드 launch)·O-7(훈련 hang) 이 원천 해소.
+  //                   그 env 값은 libbless 가 소비하지 않는다(관측용 echo 만).
+  enum { SPACE_CTX = 0, SPACE_MPS_ENV = 1 };
+  static std::atomic<int> space_mode{SPACE_CTX};
   static std::atomic<long long> fallback_launches{0}; // limited 경로가 unlimited 로 폴백한 런치 수
 
   // squad accounting
@@ -413,7 +421,10 @@ struct ScopedCtxGuard {
     target = (r==bless::UNLIMITED) ? bless::ctx_unlimited : bless::ctx_limited;
     if (target == nullptr) {   // [Exp_41 O-3] limited 생성 실패 → 명시적 폴백
       target = bless::ctx_unlimited;
-      bless::fallback_launches.fetch_add(1, std::memory_order_relaxed);
+      // [Exp_61] mps_env 모드의 ctx 부재는 폴백(실패)이 아니라 의도된 위임 경로 —
+      // O-3 폴백 카운터를 오염시키지 않는다.
+      if (bless::space_mode.load(std::memory_order_relaxed) == bless::SPACE_CTX)
+        bless::fallback_launches.fetch_add(1, std::memory_order_relaxed);
     }
     // [Exp_54 O-6] 공간 제한이 실제로 적용되지 않은 상태(limited ctx 생성 실패 =
     // 무-MPS 환경)에서는 컨텍스트 전환이 아무 이득이 없다. 그런데 전환을 하면
@@ -490,6 +501,21 @@ static void attach_runtime_if_needed() {
 
 // safe (re)create LIMITED only if no allocations yet
 static void reconf_limited_ctx(int new_sms) {
+  // [Exp_61] mps_env 모드: 제한 ctx 를 만들지 않는다. limited_applied=0 이므로
+  // ScopedCtxGuard 가 전환을 생략(Exp_54 경로) — 공간 제한은 스폰 시점에 주입된
+  // CUDA_MPS_ACTIVE_THREAD_PERCENTAGE 를 MPS 서버가 해석한다. Exp_57 PoC 4/4 ·
+  // Exp_60 훈련 12/12 정상이 이 경로다.
+  if (bless::space_mode.load(std::memory_order_relaxed) == bless::SPACE_MPS_ENV) {
+    bless::ctx_limited = nullptr;
+    bless::limited_applied.store(0);
+    bless::limited_sms.store(new_sms);
+    const char* mp = getenv("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE");   // 관측용 echo
+    fprintf(stderr, "[libbless] space_mode=mps_env: ctx affinity 생략 — 공간 제한은 "
+                    "MPS env 위임 (CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=%s)\n",
+            mp ? mp : "unset");
+    bless::gate.store(0);
+    return;
+  }
   if (bless::any_alloc.load(std::memory_order_acquire)) {
     fprintf(stderr, "[libbless] reconf_sm ignored: allocations already exist\n");
     return;
@@ -540,9 +566,23 @@ static void ensure_init() {
   cuDeviceGet(&bless::dev, 0);
   cuDeviceGetAttribute(&bless::total_sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, bless::dev);
 
+  // [Exp_61] 공간 제한 위임 방식 선택. 기본 ctx(하위호환 — 기존 동작 무변경).
+  // 미지의 값은 무음 수용 금지(PRS2 정신) — 경고 후 기본값.
+  if (const char* m = getenv("BLESS_SPACE_MODE")) {
+    if (!strcmp(m, "mps_env")) {
+      bless::space_mode.store(bless::SPACE_MPS_ENV);
+    } else if (strcmp(m, "ctx") != 0) {
+      fprintf(stderr, "[libbless] BLESS_SPACE_MODE=%s 인식 불가 — 기본 ctx 사용 "
+                      "(유효값: ctx|mps_env)\n", m);
+    }
+  }
+
   int pct = 50;
   if (const char* e = getenv("BLESS_LIMIT_PCT")) { int v=atoi(e); if (v>0 && v<100) pct = v; }
   bless::requested_pct.store(pct);
+  if (bless::space_mode.load() == bless::SPACE_MPS_ENV && getenv("BLESS_LIMIT_PCT"))
+    fprintf(stderr, "[libbless] 경고: space_mode=mps_env 에서 BLESS_LIMIT_PCT 는 "
+                    "공간 제한에 사용되지 않음 — CUDA_MPS_ACTIVE_THREAD_PERCENTAGE 로 지정할 것\n");
   int init_sms = (int)(bless::total_sms * (pct/100.0f));
   if (init_sms < 1) init_sms = 1;
   bless::limited_sms.store(init_sms);
@@ -594,10 +634,18 @@ static void ensure_init() {
     }
   }
 
+  // [Exp_61] sm_limit 3상태 — 판정은 이 로그로 한다(Exp_60 측정 함정 교훈):
+  //   applied / FALLBACK-unlimited (O-3) / delegated-mps-env
   fprintf(stderr, "[libbless] init: total_sms=%d, limited=%d, sm_limit=%s, sock=%s\n",
           bless::total_sms, bless::limited_sms.load(),
-          bless::limited_applied.load() ? "applied" : "FALLBACK-unlimited (O-3)",
+          bless::space_mode.load() == bless::SPACE_MPS_ENV ? "delegated-mps-env"
+            : bless::limited_applied.load() ? "applied" : "FALLBACK-unlimited (O-3)",
           bless::sock_path.c_str());
+  // [Exp_61] O-7 예방 breadcrumb: 훈련 워크로드 감지는 launch 파라미터에 커널
+  // 이름/형상이 없어 불가(Exp_13/48) — 대신 위험 조건(ctx 실적용)에서 1줄 고지.
+  if (bless::limited_applied.load())
+    fprintf(stderr, "[libbless] notice: ctx affinity 적용 상태 — 훈련 워크로드는 "
+                    "hang 위험(O-7). 훈련은 BLESS_SPACE_MODE=mps_env 권장\n");
 
   bless::inited.store(true);
   pthread_mutex_unlock(&bless::init_mu);
@@ -838,24 +886,31 @@ static void start_control_server(const std::string& path) {
 
       // [Exp_41 O-3] 공간 노브 실효 상태 조회 (syscall_stats 패턴)
       else if (!strncmp(buf,"sm_stats",8)) {
-        fprintf(stderr, "[libbless] sm: requested_pct=%d limited_sms=%d "
+        fprintf(stderr, "[libbless] sm: space_mode=%s requested_pct=%d limited_sms=%d "
                         "applied=%d fallback_launches=%lld total_sms=%d\n",
+                bless::space_mode.load()==bless::SPACE_MPS_ENV ? "mps_env" : "ctx",
                 bless::requested_pct.load(), bless::limited_sms.load(),
                 bless::limited_applied.load(),
                 (long long)bless::fallback_launches.load(), bless::total_sms);
       }
 
       // -------- reconf ----------
-      else if (!strncmp(buf,"reconf_sm ",10)) {
-        int k = atoi(buf+10); if (k>0) reconf_limited_ctx(k);
-      }
-      else if (!strncmp(buf,"set_limit_pct ",14)) {
-        int pct = atoi(buf+14);
-        if (pct < 1) pct = 1; if (pct > 99) pct = 99;
-        bless::requested_pct.store(pct);
-        int sms = (int)(bless::total_sms * (pct/100.0f));
-        if (sms < 1) sms = 1;
-        reconf_limited_ctx(sms);
+      // [Exp_61] mps_env 모드에서는 공간 재설정이 프로세스 밖(MPS env, 스폰 시점
+      // 고정)에 있으므로 런타임 재설정 요청을 무음 no-op 이 아니라 명시 거부한다.
+      else if (!strncmp(buf,"reconf_sm ",10) || !strncmp(buf,"set_limit_pct ",14)) {
+        if (bless::space_mode.load() == bless::SPACE_MPS_ENV) {
+          fprintf(stderr, "[libbless] REJECT %s: space_mode=mps_env 는 런타임 공간 "
+                          "재설정 불가(프로세스 단위 env) — 재스폰으로 처리할 것\n", buf);
+        } else if (!strncmp(buf,"reconf_sm ",10)) {
+          int k = atoi(buf+10); if (k>0) reconf_limited_ctx(k);
+        } else {
+          int pct = atoi(buf+14);
+          if (pct < 1) pct = 1; if (pct > 99) pct = 99;
+          bless::requested_pct.store(pct);
+          int sms = (int)(bless::total_sms * (pct/100.0f));
+          if (sms < 1) sms = 1;
+          reconf_limited_ctx(sms);
+        }
       }
 
       else if (!strncmp(buf,"quit",4)) break;
