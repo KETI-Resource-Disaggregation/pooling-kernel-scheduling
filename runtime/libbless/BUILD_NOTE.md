@@ -20,5 +20,8 @@
 - `runtime/gating_lib.so` md5 **`21a17551`** — Exp_42 기록의 232 빌드 md5와 일치(재현 빌드 검증)
 - 구 230판 `311360d1`은 git 이력( ~Exp_69)과 tar 백업에 보존.
 
+**[Exp_73 갱신]** `libbless.so` md5 **`ffb78c13`** — Exp_72 판(92fdb6ba)에 `BLESS_STATS_LOG`
+time_stats 파일 발화 추가(feeder occupancy 배선). CUDA 12.9 빌드 동일. 이미지 exp73.
+
 .so를 계속 커밋하는 이유: 소용량 + md5 계보가 보고서 전반에서 참조되는 추적
 대상(Exp_46 판단, `.gitignore` 예외 규칙 참조).

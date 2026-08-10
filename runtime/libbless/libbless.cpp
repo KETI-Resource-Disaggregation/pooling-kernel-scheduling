@@ -123,6 +123,9 @@ namespace bless {
   static std::string sock_path;
   static int g_ctrl_fd = -1;
   static std::atomic<bool> ctrl_ready{false};
+  // [Exp_73] time_stats 를 파일로도 발화 — feeder /occupancy 배선용
+  // (stderr 는 컨테이너 로그로만 가 feeder 가 못 읽음). BLESS_STATS_LOG 지정 시 open.
+  static FILE* stats_log = nullptr;
 
   static int total_sms = 0;
   static std::atomic<int> limited_sms{0};
@@ -647,6 +650,15 @@ static void ensure_init() {
     fprintf(stderr, "[libbless] notice: ctx affinity 적용 상태 — 훈련 워크로드는 "
                     "hang 위험(O-7). 훈련은 BLESS_SPACE_MODE=mps_env 권장\n");
 
+  // [Exp_73] time_stats 파일 발화 경로 — feeder occupancy 가 이 파일을 읽는다.
+  if (const char* sl = getenv("BLESS_STATS_LOG")) {
+    if (sl[0]) {
+      bless::stats_log = fopen(sl, "a");
+      if (bless::stats_log)
+        fprintf(stderr, "[libbless] stats_log=%s (feeder occupancy 배선)\n", sl);
+    }
+  }
+
   bless::inited.store(true);
   pthread_mutex_unlock(&bless::init_mu);
 }
@@ -781,6 +793,14 @@ static void start_control_server(const std::string& path) {
                 (long long)bless::avg_kernel_time_us.load(),
                 (long long)bless::total_time_us.load(),
                 (long long)bless::kernel_seq.load());
+        // [Exp_73] feeder occupancy 파싱용 파일 발화 (read_time_stats 정규식 호환:
+        // "total=<μs> kernels=<n>"). 매번 flush — 피더가 즉시 읽는다.
+        if (bless::stats_log) {
+          fprintf(bless::stats_log, "total=%lld kernels=%lld\n",
+                  (long long)bless::total_time_us.load(),
+                  (long long)bless::kernel_seq.load());
+          fflush(bless::stats_log);
+        }
       }
 
       // -------- 컨텍스트 스위칭 통계 ----------
