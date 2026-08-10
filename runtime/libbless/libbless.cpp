@@ -659,6 +659,22 @@ static void ensure_init() {
     }
   }
 
+  // [Exp_75] 워크로드 클래스 선언 파일 발화 — relaxed 자동 분류용. 파드가 env
+  // PRISM_WORKLOAD_CLASS=compute|memory 로 선언하면 여기서 class 파일에 1회 기록,
+  // bless_feeder(wirer)가 쌍 판정(aggressor+victim 공존 시 victim 해제)에 쓴다.
+  // ★선언 기반이라 남용 가능(memory 선언=gate 해제 유리) — 관측 검증은 MPS 하
+  //   DCGM 프로세스 귀속 불가로 미구현(Exp_75 A-1). 안전 기본값은 미선언=strict.
+  if (const char* cl = getenv("BLESS_CLASS_LOG")) {
+    const char* wc = getenv("PRISM_WORKLOAD_CLASS");
+    if (cl[0] && wc && wc[0]) {
+      if (FILE* cf = fopen(cl, "w")) {
+        fprintf(cf, "%s\n", wc);
+        fclose(cf);
+        fprintf(stderr, "[libbless] workload_class=%s → %s (relaxed 분류 선언)\n", wc, cl);
+      }
+    }
+  }
+
   bless::inited.store(true);
   pthread_mutex_unlock(&bless::init_mu);
 }
