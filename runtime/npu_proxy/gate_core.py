@@ -44,11 +44,14 @@ class GateCore:
     """단일 PE 의 요청 스케줄러. run_fn(req)->None 은 호출 시간 회계를
     바깥에서 하지 않는다 — GateCore.step() 이 실측·차감한다."""
 
-    def __init__(self, run_fn, clock=time.monotonic):
+    def __init__(self, run_fn, clock=time.monotonic, work_conserving=True):
         self._run = run_fn
         self._clock = clock
         self._lock = threading.Lock()
         self._tenants = {}
+        # [Exp_85] work_conserving: 크레딧 소진해도 일 있으면 후순위로 서비스(idle 안 함).
+        #   False = 기존 strict(non-work-conserving, 크레딧 소진 시 유휴 — 회귀/대조용).
+        self.work_conserving = work_conserving
 
     # ---- 테넌트 관리 ----
     def register(self, name):
@@ -112,7 +115,13 @@ class GateCore:
         cand = [t for t in ready
                 if t.unlimited or (not t.armed) or t.credit_us > 0]
         if not cand:
-            return None                       # strict: 전원 credit 소진 → 유휴
+            # [Exp_85] work-conserving: 전원 크레딧 소진이어도 일이 있으면 유휴 대신
+            #   후순위(deficit 최대)로 서비스한다. 크레딧은 "누가 먼저"만 정하고 "멈출지"는
+            #   정하지 않는다 — Exp_84/85 지연 악화(non-work-conserving idle)의 처방.
+            if self.work_conserving:
+                cand = ready
+            else:
+                return None                   # 기존 strict: 전원 credit 소진 → 유휴
         # ★deficit 선택 (max-credit 금지 — Exp_44 오답 1). granted 미주입
         # 테넌트(unlimited)는 분모 1 로 두어 charged 최소 순.
         return min(cand, key=lambda t: t.charged_us / max(t.granted_us, 1.0))
