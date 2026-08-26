@@ -7,12 +7,12 @@
 //   vmem_check_alloc()         → quota 초과 시 false 반환 → 할당 거부
 //
 // quota 출처: shm->alloc[tenant_idx].virtual_mem_mb (controller가 설정)
-// 실제 사용량: g_prism.mem_used_bytes (프로세스 로컬 카운터)
+// 실제 사용량: g_kraken.mem_used_bytes (프로세스 로컬 카운터)
 //   + shm->tenants[tenant_idx].mem_used_bytes (monitor가 읽는 stats)
 
 #include <stddef.h>
 #include <stdint.h>
-#include "../include/prism_runtime.h"
+#include "../include/kraken_runtime.h"
 
 // 단순 연결 리스트로 ptr → size 매핑 관리
 // 할당 빈도가 낮으므로 lock-free 대신 단순 배열 사용
@@ -27,9 +27,9 @@ static int alloc_table_size = 0;
 
 // quota 한도(bytes) 계산
 static int64_t quota_bytes(void) {
-    PrismSharedState* shm = g_prism.shm;
+    KrakenSharedState* shm = g_kraken.shm;
     if (!shm) return INT64_MAX;
-    int idx = g_prism.tenant_idx;
+    int idx = g_kraken.tenant_idx;
     int64_t mb = shm->alloc[idx].virtual_mem_mb;
     return (mb > 0) ? mb * 1024LL * 1024LL : INT64_MAX;
 }
@@ -39,7 +39,7 @@ bool vmem_check_alloc(size_t bytes) {
     int64_t limit = quota_bytes();
     if (limit == INT64_MAX) return true;   // quota 미설정
 
-    int64_t used = __atomic_load_n(&g_prism.mem_used_bytes, __ATOMIC_RELAXED);
+    int64_t used = __atomic_load_n(&g_kraken.mem_used_bytes, __ATOMIC_RELAXED);
     return (used + (int64_t)bytes) <= limit;
 }
 
@@ -62,12 +62,12 @@ void vmem_track_alloc(void* ptr, size_t bytes) {
     }
 
 update_count:
-    __atomic_fetch_add(&g_prism.mem_used_bytes, (int64_t)bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_kraken.mem_used_bytes, (int64_t)bytes, __ATOMIC_RELAXED);
 
     // shm stats 업데이트 (monitor가 읽음)
-    PrismSharedState* shm = g_prism.shm;
+    KrakenSharedState* shm = g_kraken.shm;
     if (shm) {
-        __atomic_fetch_add(&shm->tenants[g_prism.tenant_idx].mem_used_bytes,
+        __atomic_fetch_add(&shm->tenants[g_kraken.tenant_idx].mem_used_bytes,
                            (int64_t)bytes, __ATOMIC_RELAXED);
     }
 }
@@ -82,11 +82,11 @@ void vmem_track_free(void* ptr) {
             alloc_table[i].ptr  = nullptr;
             alloc_table[i].size = 0;
 
-            __atomic_fetch_sub(&g_prism.mem_used_bytes, sz, __ATOMIC_RELAXED);
+            __atomic_fetch_sub(&g_kraken.mem_used_bytes, sz, __ATOMIC_RELAXED);
 
-            PrismSharedState* shm = g_prism.shm;
+            KrakenSharedState* shm = g_kraken.shm;
             if (shm) {
-                __atomic_fetch_sub(&shm->tenants[g_prism.tenant_idx].mem_used_bytes,
+                __atomic_fetch_sub(&shm->tenants[g_kraken.tenant_idx].mem_used_bytes,
                                    sz, __ATOMIC_RELAXED);
             }
             return;

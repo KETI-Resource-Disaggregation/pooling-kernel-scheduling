@@ -1,9 +1,9 @@
-# libbless — prism/runtime 내재화 본 (시분할 토큰버킷 인터셉터)
+# libbless — kraken/runtime 내재화 본 (시분할 토큰버킷 인터셉터)
 
 ## 출처 (정본)
 - **KETI-Resource-Disaggregation / `pooling-kernel-scheduling`** 의 libbless 정본
   (원본 경로: `archive/pooling-kernel-scheduling/libbless/libbless.cpp`, 1219줄).
-- 본 폴더는 그 **검증 끝난 정본을 prism/runtime 안으로 복사(self-contained)** 한 것.
+- 본 폴더는 그 **검증 끝난 정본을 kraken/runtime 안으로 복사(self-contained)** 한 것.
   원본 archive/ 는 그대로 유지(이동 아님).
 
 ## 적용된 수정 (Exp_7 검증 → Exp_8 정본 반영)
@@ -13,7 +13,7 @@
    그 음수가 다음 게이트에서 `cr<0`="무제한"으로 오인되어 시분할 비례가 깨졌다.
    → CAS로 정확히 `min(cur,BURST)`만 차감(0 미만 금지)하도록 수정.
    효과: GPU 런치 천장 이내(in-envelope)에서 weight 비례 시분할이 정확·결정적
-   (2:1→0.667, 3:1→0.750). 상세: `prism/reports/Exp_7_credit_gate_fairness_230/`.
+   (2:1→0.667, 3:1→0.750). 상세: `kraken/reports/Exp_7_credit_gate_fairness_230/`.
 
 ## 적용된 수정 2 (Exp_16 검증 → Exp_18 정본 반영, 2026-07-04)
 3. **time_credit 보강 3건** (`time_credit_gate`/`time_batch_end_and_charge`/소켓 핸들러):
@@ -25,7 +25,7 @@
      사용으로 청구되던 결함(청구≈벽시계 전체) 차단.
    효과: 이종 페어(prefill×decode) 시간 비율 제어 성립 — 목표 점유 0.333~0.750 에
    오차 ≤0.007, 시간×SM(MPS) 직교, 3-tenant 3-way 확장(오차 ≤0.006).
-   상세: `prism/reports/Exp_16_time_credit_230/`(검증) · `Exp_17_generalization_230/`(일반화)
+   상세: `kraken/reports/Exp_16_time_credit_230/`(검증) · `Exp_17_generalization_230/`(일반화)
    · `Exp_18_canonical_time_reflect_230/`(정본 반영·재현·회귀).
 
 ## 미반영 상태 (★ 범위 밖, 추후 별도 결정)
@@ -48,7 +48,7 @@
 
 ## 빌드 (소스에서 재생성 가능 — 정본-바이너리 불일치 방지)
 ```bash
-cd prism/runtime/libbless
+cd kraken/runtime/libbless
 make            # = g++ -fPIC -O2 -std=c++17 -I/usr/local/cuda/include \
                 #       -o libbless.so libbless.cpp -shared -L/usr/local/cuda/lib64 \
                 #       -lcuda -lcudart -ldl -lpthread
@@ -58,7 +58,7 @@ make            # = g++ -fPIC -O2 -std=c++17 -I/usr/local/cuda/include \
 
 ## 사용 (LD_PRELOAD 인터셉션)
 ```bash
-LD_PRELOAD=.../prism/runtime/libbless/libbless.so BLESS_TENANT=A python3 <workload>
+LD_PRELOAD=.../kraken/runtime/libbless/libbless.so BLESS_TENANT=A python3 <workload>
 # 제어 소켓: /tmp/bless-{pid}.sock  (credit_set / mem_quota / set_route / time_* 등)
 # SM 비율(공간분할)은 MPS 데몬 하에서 BLESS_LIMIT_PCT로 실효 — Exp_9 참조.
 ```
@@ -66,4 +66,4 @@ LD_PRELOAD=.../prism/runtime/libbless/libbless.so BLESS_TENANT=A python3 <worklo
 ## 관련 실험
 - Exp_6: libbless 4기능 베이스라인. Exp_7: credit 게이트 3수정·envelope.
 - Exp_8: 정본에 오타+Fix1 반영·재빌드. Exp_9: MPS 하 SM 비율 실효.
-- Exp_11(본 내재화): `prism/reports/Exp_11_libbless_internalize_230/`.
+- Exp_11(본 내재화): `kraken/reports/Exp_11_libbless_internalize_230/`.

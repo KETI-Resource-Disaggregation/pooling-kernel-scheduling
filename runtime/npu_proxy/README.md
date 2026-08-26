@@ -19,8 +19,8 @@ run() 호출 비율을 게이트로 배분한다. **NPU 는 시간 축 단독** 
 
 ```bash
 python3 npu_proxy.py --pe npu0pe0 \
-  --data-sock /run/prism/npu-data.sock --admin-sock /run/prism/npu-admin.sock \
-  --sock-dir /run/prism/socks --log-dir /run/prism/logs
+  --data-sock /run/kraken/npu-data.sock --admin-sock /run/kraken/npu-admin.sock \
+  --sock-dir /run/kraken/socks --log-dir /run/kraken/logs
 ```
 
 기동 시 sanity gate(워밍업 >100ms 중단, Exp_1 계열).
