@@ -18,11 +18,19 @@ runner 를 주입받으므로 furiosa 없는 환경에서 단위 테스트 가�
 credit 상한: 잔고는 CREDIT_CAP_US 로 클램프 (유휴 후 폭주 방지 — Exp_16
 언더플로 클램프와 대칭의 상한 클램프).
 """
+import os
 import threading
 import time
 from collections import deque
 
-CREDIT_CAP_US = 100_000   # 잔고 상한 (100ms 분)
+# [Exp_99] 잔고 상한을 env 로 뺀다 — 기본값은 종전과 동일(100ms).
+#   ★이 상한이 **주입 비율을 잘라먹는다**는 것이 Exp_99 의 발견이다.
+#   feeder 가 틱마다 예산×비율을 넣는데(A 210ms, B 90ms), 상한이 100ms 면
+#   A 는 210→100 으로 클램프되고 B 는 90 그대로다 → 실효 주입비 100:90 = 1.11:1
+#   (목표 2.33 이 아니다). 예산을 4배로 올리면 A 840→100, B 360→100 으로
+#   **둘 다** 클램프되어 비율 정보가 완전히 소멸한다(실측 1.00/0.98/1.00).
+#   요청 1건의 실행시간이 상한보다 작을 때만 비율이 성립했다(mt=8, 82ms → 2.29).
+CREDIT_CAP_US = float(os.environ.get("GATE_CREDIT_CAP_US", "100000"))   # 잔고 상한
 
 
 class Tenant:
