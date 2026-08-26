@@ -9,13 +9,13 @@
 
 #include <time.h>
 #include <unistd.h>
-#include "../include/prism_runtime.h"
+#include "../include/kraken_runtime.h"
 
 void gate_killer_enter(void) {
-    PrismSharedState* shm = g_prism.shm;
+    KrakenSharedState* shm = g_kraken.shm;
     if (!shm) return;
 
-    int my = g_prism.tenant_idx;
+    int my = g_kraken.tenant_idx;
     TenantState* me = &shm->tenants[my];
 
     // PROFILING 모드: 내가 프로파일 대상이 아니면 완료될 때까지 대기
@@ -72,19 +72,19 @@ void gate_killer_enter(void) {
 mark_active:
     __atomic_store_n((int32_t*)&me->gate_state, (int32_t)GATE_KILLER_ACTIVE,
                      __ATOMIC_RELEASE);
-    clock_gettime(CLOCK_MONOTONIC, &g_prism.killer_start);
+    clock_gettime(CLOCK_MONOTONIC, &g_kraken.killer_start);
 }
 
 void gate_killer_exit(void) {
-    PrismSharedState* shm = g_prism.shm;
+    KrakenSharedState* shm = g_kraken.shm;
     if (!shm) return;
 
-    int my = g_prism.tenant_idx;
+    int my = g_kraken.tenant_idx;
     TenantState* me = &shm->tenants[my];
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    int64_t elapsed_us = timespec_diff_us(g_prism.killer_start, now);
+    int64_t elapsed_us = timespec_diff_us(g_kraken.killer_start, now);
 
     // time_remain 차감 + stats
     // NOTE: timeslice_deduct() 내부에서 total_exec_us를 누산하므로 여기서는 하지 않음

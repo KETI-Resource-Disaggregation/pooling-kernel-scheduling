@@ -11,11 +11,11 @@
 //   실제 mode 필드는 controller가 관리하므로 shm->mode를 직접 읽는 것이 정석.
 //   이 함수는 런타임 내부 진단·테스트 용도.
 
-#include "../include/prism_runtime.h"
+#include "../include/kraken_runtime.h"
 
 // 현재 shm의 virtual_sm_total > physical_sm_total 여부
 bool resource_is_overcommit(void) {
-    PrismSharedState* shm = g_prism.shm;
+    KrakenSharedState* shm = g_kraken.shm;
     if (!shm) return false;
 
     // virtual_sm_total은 controller 단독 write (non-atomic) → acquire fence 후 plain read

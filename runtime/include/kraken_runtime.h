@@ -1,4 +1,4 @@
-// prism_runtime.h
+// kraken_runtime.h
 // runtime 내부 공통 헤더
 // gating_lib.so 전체에서 공유하는 타입, 전역 상태, 인터페이스
 
@@ -7,12 +7,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
-#include "../../shm/prism_shm.h"
+#include "../../shm/kraken_shm.h"
 
 // ── 환경변수 키 ────────────────────────────────────────────────────────────────
-#define ENV_TENANT_ID    "PRISM_TENANT"
-#define ENV_GROUP_ID     "PRISM_GROUP"
-#define ENV_POLICY_PATH  "PRISM_KILLER_POLICY"
+#define ENV_TENANT_ID    "KRAKEN_TENANT"
+#define ENV_GROUP_ID     "KRAKEN_GROUP"
+#define ENV_POLICY_PATH  "KRAKEN_KILLER_POLICY"
 
 // ── 기본값 ─────────────────────────────────────────────────────────────────────
 #define DEFAULT_GROUP_ID         "default"
@@ -35,7 +35,7 @@ typedef struct {
 // ── 런타임 전역 상태 (프로세스 하나에 하나) ────────────────────────────────────
 typedef struct {
     // shm
-    PrismSharedState* shm;
+    KrakenSharedState* shm;
     int               tenant_idx;       // 이 프로세스의 테넌트 인덱스
     char              tenant_id[16];
     char              group_id[64];
@@ -57,16 +57,16 @@ typedef struct {
 
     // 초기화 완료 여부
     bool              initialized;
-} PrismRuntime;
+} KrakenRuntime;
 
 // ── 전역 인스턴스 (cuda_hooks.cpp에서 정의) ────────────────────────────────────
-extern PrismRuntime g_prism;
+extern KrakenRuntime g_kraken;
 
 // ── 인터페이스 선언 ────────────────────────────────────────────────────────────
 
 // shm_client.h
-void     prism_shm_open(const char* group_id);
-void     prism_shm_close(void);
+void     kraken_shm_open(const char* group_id);
+void     kraken_shm_close(void);
 
 // gating/stream_gate.h
 void     gate_killer_enter(void);

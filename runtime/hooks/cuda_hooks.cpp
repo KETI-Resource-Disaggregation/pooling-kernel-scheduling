@@ -18,10 +18,10 @@
 #include <ctype.h>
 
 // hot-reload: profiler가 killer policy를 교체할 때 사용하는 well-known 경로
-// 형식: /tmp/prism_killers_{group_id}_{tenant_idx}.json
-#define HOT_POLICY_PATH_FMT "/tmp/prism_killers_%s_%d.json"
+// 형식: /tmp/kraken_killers_{group_id}_{tenant_idx}.json
+#define HOT_POLICY_PATH_FMT "/tmp/kraken_killers_%s_%d.json"
 
-#include "../include/prism_runtime.h"
+#include "../include/kraken_runtime.h"
 
 // ── forward 선언 (dlsym/cuGetProcAddress hook이 주소를 참조하므로 필요) ─────────
 extern "C" CUresult cuLaunchKernel(
@@ -68,7 +68,7 @@ void* dlsym(void* handle, const char* symbol) {
 }
 
 // ── 전역 런타임 인스턴스 ───────────────────────────────────────────────────────
-PrismRuntime g_prism = {};
+KrakenRuntime g_kraken = {};
 
 // ── cudaLaunchKernel 함수 포인터 (Runtime API) ────────────────────────────────
 // <<<>>> 구문으로 컴파일된 CUDA 커널은 cudaLaunchKernel을 통해 제출됨.
@@ -109,7 +109,7 @@ static cudaError_t (*real_cudaFree)(void*)                = nullptr;
 // ── killer 판단 ────────────────────────────────────────────────────────────────
 static bool is_killer_by_name(const char* name) {
     if (!name) return false;
-    KillerPolicy* p = &g_prism.policy;
+    KillerPolicy* p = &g_kraken.policy;
     for (int i = 0; i < p->count; i++) {
         if (strstr(name, p->names[i])) return true;
     }
@@ -117,7 +117,7 @@ static bool is_killer_by_name(const char* name) {
 }
 
 static bool is_killer_by_index(int idx) {
-    KillerPolicy* p = &g_prism.policy;
+    KillerPolicy* p = &g_kraken.policy;
     int iter_idx = (p->kernels_per_iter > 0)
                    ? (idx % p->kernels_per_iter)
                    : idx;
@@ -133,14 +133,14 @@ static bool is_killer(CUfunction f) {
     cuFuncGetName(&name, f);
 #endif
     if (name && is_killer_by_name(name)) return true;
-    return is_killer_by_index(g_prism.kernel_idx);
+    return is_killer_by_index(g_kraken.kernel_idx);
 }
 
 // ── 초기화 / 종료 ──────────────────────────────────────────────────────────────
 static void load_killer_policy(const char* path);
 
 __attribute__((constructor))
-static void prism_init(void) {
+static void kraken_init(void) {
     // real_dlsym을 제일 먼저 확보: dlsym hook이 즉시 동작 가능하도록.
     // dlvsym은 versioned symbol lookup으로 우리 dlsym hook을 재귀 호출하지 않음.
     real_dlsym = (void*(*)(void*, const char*))
@@ -155,54 +155,54 @@ static void prism_init(void) {
     const char* policy_path = getenv(ENV_POLICY_PATH);
 
     if (!tenant_id) {
-        fprintf(stderr, "[prism] %s 없음, 게이팅 비활성\n", ENV_TENANT_ID);
+        fprintf(stderr, "[kraken] %s 없음, 게이팅 비활성\n", ENV_TENANT_ID);
         return;
     }
 
-    strncpy(g_prism.tenant_id, tenant_id, sizeof(g_prism.tenant_id) - 1);
-    strncpy(g_prism.group_id,
+    strncpy(g_kraken.tenant_id, tenant_id, sizeof(g_kraken.tenant_id) - 1);
+    strncpy(g_kraken.group_id,
             group_id ? group_id : DEFAULT_GROUP_ID,
-            sizeof(g_prism.group_id) - 1);
+            sizeof(g_kraken.group_id) - 1);
 
-    prism_shm_open(g_prism.group_id);
-    if (!g_prism.shm) {
-        fprintf(stderr, "[prism] shm 연결 실패, 게이팅 비활성\n");
+    kraken_shm_open(g_kraken.group_id);
+    if (!g_kraken.shm) {
+        fprintf(stderr, "[kraken] shm 연결 실패, 게이팅 비활성\n");
         return;
     }
 
     if (policy_path) {
-        strncpy(g_prism.policy_path, policy_path, sizeof(g_prism.policy_path) - 1);
+        strncpy(g_kraken.policy_path, policy_path, sizeof(g_kraken.policy_path) - 1);
         load_killer_policy(policy_path);
     } else {
         // policy 없음: 기본 패턴으로 동작 (1단계 패턴 매칭)
-        fprintf(stderr, "[prism] killer policy 없음, 기본 패턴 매칭 모드\n");
+        fprintf(stderr, "[kraken] killer policy 없음, 기본 패턴 매칭 모드\n");
         static const char* defaults[] = {
             "sgemm", "dgemm", "hgemm", "gemm",
             "fprop", "xmma", "cutlass", "fmha",
             "matmul", nullptr
         };
         for (int i = 0; defaults[i] && i < MAX_KILLER_KERNELS; i++) {
-            strncpy(g_prism.policy.names[i], defaults[i], MAX_KERNEL_NAME_LEN - 1);
-            g_prism.policy.count++;
+            strncpy(g_kraken.policy.names[i], defaults[i], MAX_KERNEL_NAME_LEN - 1);
+            g_kraken.policy.count++;
         }
     }
 
     // 현재 shm.killer_policy_version을 기록 → 초기화 직후 불필요한 재로드 방지
-    if (g_prism.shm) {
-        g_prism.loaded_killer_version = __atomic_load_n(
-            &g_prism.shm->killer_policy_version, __ATOMIC_ACQUIRE);
+    if (g_kraken.shm) {
+        g_kraken.loaded_killer_version = __atomic_load_n(
+            &g_kraken.shm->killer_policy_version, __ATOMIC_ACQUIRE);
     }
 
-    g_prism.initialized = true;
-    fprintf(stderr, "[prism] 초기화 완료: tenant=%s group=%s killers=%d\n",
-            g_prism.tenant_id, g_prism.group_id, g_prism.policy.count);
+    g_kraken.initialized = true;
+    fprintf(stderr, "[kraken] 초기화 완료: tenant=%s group=%s killers=%d\n",
+            g_kraken.tenant_id, g_kraken.group_id, g_kraken.policy.count);
 }
 
 __attribute__((destructor))
-static void prism_fini(void) {
-    if (g_prism.shm && g_prism.initialized) {
-        g_prism.shm->tenants[g_prism.tenant_idx].active = 0;
-        prism_shm_close();
+static void kraken_fini(void) {
+    if (g_kraken.shm && g_kraken.initialized) {
+        g_kraken.shm->tenants[g_kraken.tenant_idx].active = 0;
+        kraken_shm_close();
     }
 }
 
@@ -216,7 +216,7 @@ CUresult cuLaunchKernel(
     void** kernelParams, void** extra)
 {
     LAZY_RESOLVE(real_cuLaunchKernel, "cuLaunchKernel");
-    if (!g_prism.initialized || !real_cuLaunchKernel)
+    if (!g_kraken.initialized || !real_cuLaunchKernel)
         return real_cuLaunchKernel
                ? real_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ,
                                      blockDimX, blockDimY, blockDimZ,
@@ -242,7 +242,7 @@ CUresult cuLaunchKernel(
         gate_killer_exit();
     }
 
-    g_prism.kernel_idx++;
+    g_kraken.kernel_idx++;
     return r;
 }
 
@@ -254,7 +254,7 @@ CUresult cuLaunchKernelEx(
     void** kernelParams, void** extra)
 {
     LAZY_RESOLVE(real_cuLaunchKernelEx, "cuLaunchKernelEx");
-    if (!g_prism.initialized || !real_cuLaunchKernelEx)
+    if (!g_kraken.initialized || !real_cuLaunchKernelEx)
         return real_cuLaunchKernelEx
                ? real_cuLaunchKernelEx(config, f, kernelParams, extra)
                : CUDA_ERROR_NOT_INITIALIZED;
@@ -270,7 +270,7 @@ CUresult cuLaunchKernelEx(
         gate_killer_exit();
     }
 
-    g_prism.kernel_idx++;
+    g_kraken.kernel_idx++;
     return r;
 }
 
@@ -319,7 +319,7 @@ static bool is_cuda_rt_killer(const void* func) {
     if (dladdr(func, &info) && info.dli_sname) {
         if (is_killer_by_name(info.dli_sname)) return true;
     }
-    return is_killer_by_index(g_prism.kernel_idx);
+    return is_killer_by_index(g_kraken.kernel_idx);
 }
 
 extern "C"
@@ -331,7 +331,7 @@ cudaError_t cudaLaunchKernel(
     cudaStream_t stream)
 {
     LAZY_RESOLVE(real_cudaLaunchKernel, "cudaLaunchKernel");
-    if (!g_prism.initialized || !real_cudaLaunchKernel)
+    if (!g_kraken.initialized || !real_cudaLaunchKernel)
         return real_cudaLaunchKernel
                ? real_cudaLaunchKernel(func, gridDim, blockDim, args, sharedMem, stream)
                : cudaErrorNoDevice;
@@ -347,7 +347,7 @@ cudaError_t cudaLaunchKernel(
         gate_killer_exit();
     }
 
-    g_prism.kernel_idx++;
+    g_kraken.kernel_idx++;
     return r;
 }
 
@@ -355,11 +355,11 @@ cudaError_t cudaLaunchKernel(
 extern "C"
 CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
     LAZY_RESOLVE(real_cuMemAlloc, "cuMemAlloc_v2");
-    if (!g_prism.initialized || !real_cuMemAlloc)
+    if (!g_kraken.initialized || !real_cuMemAlloc)
         return real_cuMemAlloc ? real_cuMemAlloc(dptr, bytesize) : CUDA_ERROR_NOT_INITIALIZED;
 
     if (!vmem_check_alloc(bytesize)) {
-        fprintf(stderr, "[prism] cuMemAlloc quota 초과 (%zu bytes)\n", bytesize);
+        fprintf(stderr, "[kraken] cuMemAlloc quota 초과 (%zu bytes)\n", bytesize);
         return CUDA_ERROR_OUT_OF_MEMORY;
     }
     CUresult r = real_cuMemAlloc(dptr, bytesize);
@@ -370,7 +370,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
 extern "C"
 CUresult cuMemFree_v2(CUdeviceptr dptr) {
     LAZY_RESOLVE(real_cuMemFree, "cuMemFree_v2");
-    if (!g_prism.initialized || !real_cuMemFree)
+    if (!g_kraken.initialized || !real_cuMemFree)
         return real_cuMemFree ? real_cuMemFree(dptr) : CUDA_ERROR_NOT_INITIALIZED;
 
     vmem_track_free((void*)(uintptr_t)dptr);
@@ -380,11 +380,11 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
 extern "C"
 cudaError_t cudaMalloc(void** devPtr, size_t size) {
     LAZY_RESOLVE(real_cudaMalloc, "cudaMalloc");
-    if (!g_prism.initialized || !real_cudaMalloc)
+    if (!g_kraken.initialized || !real_cudaMalloc)
         return real_cudaMalloc ? real_cudaMalloc(devPtr, size) : cudaErrorNoDevice;
 
     if (!vmem_check_alloc(size)) {
-        fprintf(stderr, "[prism] cudaMalloc quota 초과 (%zu bytes)\n", size);
+        fprintf(stderr, "[kraken] cudaMalloc quota 초과 (%zu bytes)\n", size);
         return cudaErrorMemoryAllocation;
     }
     cudaError_t r = real_cudaMalloc(devPtr, size);
@@ -395,7 +395,7 @@ cudaError_t cudaMalloc(void** devPtr, size_t size) {
 extern "C"
 cudaError_t cudaFree(void* devPtr) {
     LAZY_RESOLVE(real_cudaFree, "cudaFree");
-    if (!g_prism.initialized || !real_cudaFree)
+    if (!g_kraken.initialized || !real_cudaFree)
         return real_cudaFree ? real_cudaFree(devPtr) : cudaErrorNoDevice;
 
     vmem_track_free(devPtr);
@@ -453,7 +453,7 @@ static int parse_int_field(const char* json, const char* key) {
 static void load_killer_policy(const char* path) {
     FILE* f = fopen(path, "r");
     if (!f) {
-        fprintf(stderr, "[prism] policy 파일 없음: %s\n", path);
+        fprintf(stderr, "[kraken] policy 파일 없음: %s\n", path);
         return;
     }
     fseek(f, 0, SEEK_END);
@@ -465,7 +465,7 @@ static void load_killer_policy(const char* path) {
     buf[sz] = '\0';
     fclose(f);
 
-    KillerPolicy* p = &g_prism.policy;
+    KillerPolicy* p = &g_kraken.policy;
 
     parse_int_array(buf, "\"killer_indices\"",
                     p->indices, &p->count, MAX_KILLER_KERNELS);
@@ -474,39 +474,39 @@ static void load_killer_policy(const char* path) {
     parse_string_array(buf, "\"killer_names\"",
                        p->names, &name_count, MAX_KILLER_KERNELS);
 
-    g_prism.kernels_per_iter = parse_int_field(buf, "\"kernels_per_iter\"");
-    p->kernels_per_iter      = g_prism.kernels_per_iter;
+    g_kraken.kernels_per_iter = parse_int_field(buf, "\"kernels_per_iter\"");
+    p->kernels_per_iter      = g_kraken.kernels_per_iter;
     p->loaded = true;
 
     free(buf);
-    fprintf(stderr, "[prism] policy 로드: %d killers, iter_len=%d\n",
-            p->count, g_prism.kernels_per_iter);
+    fprintf(stderr, "[kraken] policy 로드: %d killers, iter_len=%d\n",
+            p->count, g_kraken.kernels_per_iter);
 }
 
 // ── killer policy hot-reload ───────────────────────────────────────────────────
 // round_manager.cpp의 start_new_round()에서 호출.
 // shm.killer_policy_version이 마지막 로드 이후 바뀌었으면 JSON을 재로드.
 void reload_killer_policy_if_needed(void) {
-    PrismSharedState* shm = g_prism.shm;
-    if (!shm || !g_prism.initialized) return;
+    KrakenSharedState* shm = g_kraken.shm;
+    if (!shm || !g_kraken.initialized) return;
 
     uint64_t shm_ver = __atomic_load_n(&shm->killer_policy_version, __ATOMIC_ACQUIRE);
-    if (shm_ver == g_prism.loaded_killer_version) return;
+    if (shm_ver == g_kraken.loaded_killer_version) return;
 
     // well-known hot-reload 경로 확인
     char hot_path[256];
     snprintf(hot_path, sizeof(hot_path), HOT_POLICY_PATH_FMT,
-             g_prism.group_id, g_prism.tenant_idx);
+             g_kraken.group_id, g_kraken.tenant_idx);
 
     // 기존 policy 초기화
-    memset(&g_prism.policy, 0, sizeof(g_prism.policy));
-    g_prism.kernels_per_iter = 0;
+    memset(&g_kraken.policy, 0, sizeof(g_kraken.policy));
+    g_kraken.kernels_per_iter = 0;
 
     if (access(hot_path, R_OK) == 0) {
         load_killer_policy(hot_path);
-    } else if (g_prism.policy_path[0] && access(g_prism.policy_path, R_OK) == 0) {
+    } else if (g_kraken.policy_path[0] && access(g_kraken.policy_path, R_OK) == 0) {
         // hot-path 없으면 원본 ENV_POLICY_PATH 재로드
-        load_killer_policy(g_prism.policy_path);
+        load_killer_policy(g_kraken.policy_path);
     } else {
         // 둘 다 없으면 기본 패턴 복구
         static const char* defaults[] = {
@@ -515,11 +515,11 @@ void reload_killer_policy_if_needed(void) {
             "matmul", nullptr
         };
         for (int i = 0; defaults[i] && i < MAX_KILLER_KERNELS; i++) {
-            strncpy(g_prism.policy.names[i], defaults[i], MAX_KERNEL_NAME_LEN - 1);
-            g_prism.policy.count++;
+            strncpy(g_kraken.policy.names[i], defaults[i], MAX_KERNEL_NAME_LEN - 1);
+            g_kraken.policy.count++;
         }
-        fprintf(stderr, "[prism] hot-reload: policy 없음, 기본 패턴 복구\n");
+        fprintf(stderr, "[kraken] hot-reload: policy 없음, 기본 패턴 복구\n");
     }
 
-    g_prism.loaded_killer_version = shm_ver;
+    g_kraken.loaded_killer_version = shm_ver;
 }

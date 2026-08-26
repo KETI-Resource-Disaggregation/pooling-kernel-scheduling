@@ -4,13 +4,13 @@
 // 중앙 스케줄러의 policy.version 변경도 이 시점에 반영
 
 #include <stdio.h>
-#include "../include/prism_runtime.h"
+#include "../include/kraken_runtime.h"
 
 // 외부 선언 (time_slice.cpp)
 extern void timeslice_recharge(int tenant_idx, int64_t slice_us);
 
 // 모든 active 테넌트가 WAITING인지 확인
-static bool all_waiting(PrismSharedState* shm) {
+static bool all_waiting(KrakenSharedState* shm) {
     for (int i = 0; i < shm->tenant_count; i++) {
         if (!__atomic_load_n(&shm->tenants[i].active, __ATOMIC_RELAXED))
             continue;
@@ -22,7 +22,7 @@ static bool all_waiting(PrismSharedState* shm) {
 }
 
 // slice_us 계산: round_duration × weight[i] / total_weight
-static int64_t calc_slice_us(PrismSharedState* shm, int tenant_idx) {
+static int64_t calc_slice_us(KrakenSharedState* shm, int tenant_idx) {
     float total_w = 0.0f;
     for (int i = 0; i < shm->tenant_count; i++) {
         if (__atomic_load_n(&shm->tenants[i].active, __ATOMIC_RELAXED))
@@ -39,8 +39,8 @@ static int64_t calc_slice_us(PrismSharedState* shm, int tenant_idx) {
 }
 
 // 새 라운드 시작 (마지막 WAITING 테넌트가 CAS 획득 후 호출)
-static void start_new_round(PrismSharedState* shm) {
-    int my = g_prism.tenant_idx;
+static void start_new_round(KrakenSharedState* shm) {
+    int my = g_kraken.tenant_idx;
 
     // CAS: round_trigger_lock 0→1 획득 (TOCTOU 방지)
     // 여러 테넌트가 동시에 all_waiting()=true를 봐도 한 테넌트만 진입
@@ -78,7 +78,7 @@ static void start_new_round(PrismSharedState* shm) {
 // gate_killer_enter에서 WAITING 전환 직후 호출
 // 내가 마지막으로 WAITING이 된 테넌트라면 새 라운드 트리거
 void round_check_and_trigger(void) {
-    PrismSharedState* shm = g_prism.shm;
+    KrakenSharedState* shm = g_kraken.shm;
     if (!shm) return;
 
     if (all_waiting(shm)) {
