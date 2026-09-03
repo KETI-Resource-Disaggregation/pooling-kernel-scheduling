@@ -138,8 +138,26 @@ namespace bless {
   //                   libbless 는 제한 ctx 를 만들지 않고 ctx 전환도 하지 않는다
   //                   → O-6b(별도 스레드 launch)·O-7(훈련 hang) 이 원천 해소.
   //                   그 env 값은 libbless 가 소비하지 않는다(관측용 echo 만).
-  enum { SPACE_CTX = 0, SPACE_MPS_ENV = 1 };
+  //   SPACE_QMD     : [Exp_109] QMD TPC_DISABLE_MASK 직접 조작(미문서 인터페이스).
+  //                   런타임 재설정 가능 — mps_env 가 못 하는 것이 이것이다.
+  enum { SPACE_CTX = 0, SPACE_MPS_ENV = 1, SPACE_QMD = 2 };
   static std::atomic<int> space_mode{SPACE_CTX};
+
+  // ======== [Exp_109 Q-1] QMD 마스킹 ========
+  // Exp_105 실측 확정: RTX PRO 6000 Blackwell / driver 590.48.01 / QMD V05_00
+  //   TPC 94개(SM 188, TPC당 SM 2), TPC_DISABLE_MASK(i) = byte 280+4i (32 TPC씩),
+  //   TPC_DISABLE_MASK_VALID = byte 19 bit7, QMD_MAJOR_VERSION = byte 58 상위 니블.
+  //   ★비트 1 = 그 TPC **금지**(DISABLE 마스크라 극성이 반대).
+  // ★미문서 인터페이스다. 드라이버 버전이 다르면 무엇이 일어날지 모른다 →
+  //   검증된 버전이 아니면 QMD 모드 진입을 거부한다(아래 qmd_driver_ok).
+  static const int QMD_TPC_TOTAL = 94;
+  static std::atomic<bool>      qmd_active{false};
+  static std::atomic<uint32_t>  qmd_mask_w0{0};   // TPC 0-31   (1=금지)
+  static std::atomic<uint32_t>  qmd_mask_w1{0};   // TPC 32-63
+  static std::atomic<uint32_t>  qmd_mask_w2{0};   // TPC 64-95
+  static std::atomic<int>       qmd_allowed_tpc{QMD_TPC_TOTAL};
+  static std::atomic<long long> qmd_reconf_count{0};
+  static std::atomic<long long> qmd_reconf_total_us{0};
   static std::atomic<long long> fallback_launches{0}; // limited 경로가 unlimited 로 폴백한 런치 수
 
   // squad accounting
@@ -202,7 +220,23 @@ namespace bless {
   static std::atomic<int64_t> ctx_switch_count{0};        // 총 컨텍스트 스위치 횟수
   static std::atomic<int64_t> ctx_switch_total_us{0};     // 총 컨텍스트 스위치 시간(us)
   static std::atomic<int64_t> ctx_switch_avg_us{0};       // 평균 컨텍스트 스위치 시간(us)
-  static std::atomic<int64_t> ctx_switch_max_us{0};       // 최대 컨텍스트 스위치 시간(us)
+  static std::atomic<int64_t> ctx_switch_max_us{0};
+
+  // ======== [Exp_108 D-2] 게이트 전환 계측 ========
+  // ★전환의 정의: **크레딧 소진으로 커널 제출이 막히고, 크레딧이 도착해 재개하기까지**
+  //   를 게이트 전환 1회로 센다. 위 ctx_switch(cuCtxPushCurrent/Pop 비용)와 다른 사건이다.
+  //     · ctx_switch : CUDA 컨텍스트 교체 비용 — 라우팅마다 발생, 슬라이스 길이와 무관
+  //     · gate_block : 시분할로 실제로 **기다린** 사건 — 슬라이스가 짧을수록 잦아진다
+  //   슬라이스 길이에 반응하는 것은 후자이므로 D-2 의 대상은 gate_block 이다.
+  //   (작업 전환=다른 테넌트로 넘어가는 사건은 libbless 가 프로세스-로컬이라 관측 불가)
+  //
+  // ★계측 부담: 진입/탈출 now_us() 2회 + relaxed atomic 3회. 대기 루프가 이미
+  //   sched_yield/nanosleep(20us)을 돌므로 그보다 훨씬 싸다. 그래도 opt-in 으로 두어
+  //   기본 꺼짐에서는 분기 1회만 남긴다(BLESS_GATE_METRICS=1 로 켠다).
+  static std::atomic<bool>    gate_metrics_on{false};
+  static std::atomic<int64_t> gate_block_count{0};
+  static std::atomic<int64_t> gate_block_total_us{0};
+  static std::atomic<int64_t> gate_block_max_us{0};       // 최대 컨텍스트 스위치 시간(us)
   // =============================================
 
   // ======== 우선순위 기반 커널 큐 시스템 ========
@@ -347,6 +381,112 @@ static inline void time_batch_end_and_charge() {
   tl_batch_start_us = 0;
 }
 
+// ======== [Exp_109 Q-1] QMD 마스킹 구현 ========
+// libsmctrl(Bakita & Anderson, RTAS'23) 의 QMD 훅을 libbless 안으로 가져온 것.
+//   Exp_105 에서 이 하드웨어·드라이버에 맞게 고친 판(V05_00 분기, 128비트 마스크)을 따른다.
+// ★기존 space_mode(ctx / mps_env) 경로는 건드리지 않는다. 분기만 추가한다.
+static const CUuuid kQmdCallbackFuncsId = {{0x2c, (char)0x8e, 0x0a, (char)0xd8, 0x07, 0x10,
+    (char)0xab, 0x4e, (char)0x90, (char)0xdd, 0x54, 0x71, (char)0x9f, (char)0xe5,
+    (char)0xf7, 0x4b}};
+#define KRAKEN_QMD_DOMAIN     0xb
+#define KRAKEN_QMD_PRE_UPLOAD 0x1
+
+// 검증된 드라이버. 다르면 QMD 모드를 거부한다(미문서 인터페이스이므로).
+#define KRAKEN_QMD_DRIVER_VERIFIED "590.48.01"
+
+static volatile int g_qmd_setup_done = 0;
+
+// 커널 런치 직전 QMD 를 가로채 TPC_DISABLE_MASK 를 덮어쓴다.
+static void kraken_qmd_callback(void*, int, int, const void* in_params) {
+  if (!bless::qmd_active.load(std::memory_order_relaxed)) return;
+  if (*(const uint32_t*)in_params < 5 * sizeof(void*)) return;
+  void* tmd = *((void**)in_params + 4);
+  if (!tmd) return;
+  // QMD_MAJOR_VERSION: V05 계열은 byte 58 상위 니블(Exp_105 진단으로 확정).
+  const uint8_t v5 = *(uint8_t*)((char*)tmd + 58) >> 4;
+  if (v5 < 0x5) return;                      // 이 하드웨어가 아니면 손대지 않는다
+  uint32_t* w = (uint32_t*)((char*)tmd + 280);   // TPC_DISABLE_MASK(i)
+  w[0] = bless::qmd_mask_w0.load(std::memory_order_relaxed);
+  w[1] = bless::qmd_mask_w1.load(std::memory_order_relaxed);
+  w[2] = bless::qmd_mask_w2.load(std::memory_order_relaxed);
+  w[3] = 0;                                   // TPC 96-127 (이 카드엔 없음)
+  *(uint8_t*)((char*)tmd + 19) |= 0x80;       // TPC_DISABLE_MASK_VALID
+}
+
+static bool kraken_qmd_setup() {
+  if (__atomic_test_and_set(&g_qmd_setup_done, __ATOMIC_SEQ_CST)) return true;
+  int (*subscribe)(uint32_t*, void(*)(void*, int, int, const void*), void*);
+  int (*enable)(uint32_t, uint32_t, int, int);
+  uintptr_t* tbl = nullptr; uint32_t hndl = 0;
+  if (cuGetExportTable((const void**)&tbl, &kQmdCallbackFuncsId) != CUDA_SUCCESS || !tbl) {
+    fprintf(stderr, "[libbless][경고] QMD: cuGetExportTable 실패 — QMD 모드 진입 불가, "
+                    "이전 공간 모드를 유지한다\n");
+    return false;
+  }
+  subscribe = (decltype(subscribe))*(tbl + 3);
+  enable    = (decltype(enable))*(tbl + 6);
+  if (subscribe(&hndl, kraken_qmd_callback, nullptr) != 0 ||
+      enable(1, hndl, KRAKEN_QMD_DOMAIN, KRAKEN_QMD_PRE_UPLOAD) != 0) {
+    fprintf(stderr, "[libbless][경고] QMD: 런치 콜백 등록 실패 — QMD 모드 진입 불가\n");
+    return false;
+  }
+  return true;
+}
+
+// 허용 TPC 개수 → 마스크. **비트 1 = 금지**이므로 앞의 n개만 0으로 둔다.
+// ★배치: 기본은 연속(앞에서부터). BLESS_QMD_SPREAD=1 이면 분산(2칸 간격) —
+//   캐시·메모리 국소성 차이를 Q-4 에서 재기 위한 스위치다. 어느 쪽이 나은지는 측정으로 정한다.
+static void kraken_qmd_set_allowed(int n_allowed) {
+  const int total = bless::QMD_TPC_TOTAL;
+  // ★안전장치: 0개 TPC 는 작업을 영원히 멈춘다. 최소 1개를 보장한다.
+  if (n_allowed < 1) {
+    fprintf(stderr, "[libbless][경고] QMD: 허용 TPC %d → 1 로 올림(0개는 영구 정지)\n",
+            n_allowed);
+    n_allowed = 1;
+  }
+  if (n_allowed > total) n_allowed = total;
+  const bool spread = getenv("BLESS_QMD_SPREAD") && getenv("BLESS_QMD_SPREAD")[0] == '1';
+  uint32_t m[3] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};   // 전부 금지에서 시작
+  int given = 0;
+  if (spread) {
+    const int stride = (n_allowed > 0) ? (total / n_allowed) : 1;
+    for (int t = 0; t < total && given < n_allowed; t += (stride > 0 ? stride : 1)) {
+      m[t >> 5] &= ~(1u << (t & 31)); ++given;
+    }
+    for (int t = 0; t < total && given < n_allowed; ++t)     // 모자라면 앞에서 보충
+      if (m[t >> 5] & (1u << (t & 31))) { m[t >> 5] &= ~(1u << (t & 31)); ++given; }
+  } else {
+    for (int t = 0; t < n_allowed; ++t) { m[t >> 5] &= ~(1u << (t & 31)); ++given; }
+  }
+  // TPC 94,95 는 이 카드에 없다 — 마스크에 남겨두어도 무해하나 명시적으로 금지 유지.
+  bless::qmd_mask_w0.store(m[0], std::memory_order_relaxed);
+  bless::qmd_mask_w1.store(m[1], std::memory_order_relaxed);
+  bless::qmd_mask_w2.store(m[2], std::memory_order_relaxed);
+  bless::qmd_allowed_tpc.store(given, std::memory_order_relaxed);
+}
+
+// 요청 pct → 허용 TPC 개수.
+// ★변환 규칙: **올림(ceil)**. 몫이 부족한 쪽으로 깎이면 계약 위반이기 때문이다.
+//   대신 합이 물리 용량을 넘을 수 있는데, QMD 마스크는 프로세스별로 독립 적용되고
+//   초과분은 하드웨어가 시분할로 흡수한다(마스크는 '이 TPC 를 쓰지 마라'일 뿐
+//   '독점하라'가 아니다). 즉 합>100% 는 오버커밋과 같은 의미이며 우리 배정 정책과 일치한다.
+static int kraken_qmd_pct_to_tpc(int pct) {
+  if (pct < 1) pct = 1; if (pct > 100) pct = 100;
+  return (bless::QMD_TPC_TOTAL * pct + 99) / 100;      // ceil
+}
+
+// [Exp_108 D-2] 게이트 전환 1회 기록. 매 전환 로그는 내지 않는다(누적만) —
+//   전환 비용이 μs 단위라 로그 출력이 측정 대상보다 비싸진다.
+static inline void bless_gate_block_record(int64_t t0) {
+  const int64_t d = now_us() - t0;
+  bless::gate_block_count.fetch_add(1, std::memory_order_relaxed);
+  bless::gate_block_total_us.fetch_add(d, std::memory_order_relaxed);
+  int64_t cur = bless::gate_block_max_us.load(std::memory_order_relaxed);
+  while (d > cur) {
+    if (bless::gate_block_max_us.compare_exchange_weak(cur, d)) break;
+  }
+}
+
 static inline void time_credit_gate() {
   if (__builtin_expect(bless::boost_mode.load(std::memory_order_relaxed), 0)) return;
   if (__builtin_expect(bless::time_unlimited.load(std::memory_order_relaxed), 1)) return;
@@ -356,6 +496,9 @@ static inline void time_credit_gate() {
   // 원본은 배치 창이 열린 채 게이트에서 대기해 "대기 시간까지 사용으로 청구"
   // (Exp_16 실측: 청구량 ≈ 벽시계 전체). 대기 시간은 사용이 아니다.
   time_batch_end_and_charge();
+  // [Exp_108 D-2] 게이트 전환 진입 — 여기부터 재개까지가 1회 전환.
+  const bool gm = bless::gate_metrics_on.load(std::memory_order_relaxed);
+  const int64_t gate_t0 = gm ? now_us() : 0;
   int waited = 0;
   while (credit <= 0) {
     if (waited < 50) {
@@ -366,9 +509,13 @@ static inline void time_credit_gate() {
       nanosleep(&ts, nullptr);
       waited = 0;
     }
-    if (bless::time_unlimited.load(std::memory_order_relaxed)) return;
+    if (bless::time_unlimited.load(std::memory_order_relaxed)) {
+      if (gm) bless_gate_block_record(gate_t0);   // 무제한 전환도 1회로 센다
+      return;
+    }
     credit = bless::time_credit_us.load(std::memory_order_acquire);
   }
+  if (gm) bless_gate_block_record(gate_t0);
 }
 
 // ---- 샘플링 기반 측정 (백업용) ----
@@ -508,7 +655,22 @@ static void reconf_limited_ctx(int new_sms) {
   // ScopedCtxGuard 가 전환을 생략(Exp_54 경로) — 공간 제한은 스폰 시점에 주입된
   // CUDA_MPS_ACTIVE_THREAD_PERCENTAGE 를 MPS 서버가 해석한다. Exp_57 PoC 4/4 ·
   // Exp_60 훈련 12/12 정상이 이 경로다.
-  if (bless::space_mode.load(std::memory_order_relaxed) == bless::SPACE_MPS_ENV) {
+  if (bless::space_mode.load(std::memory_order_relaxed) == bless::SPACE_QMD) {
+    // [Exp_109 Q-1] QMD 모드: 콜백을 걸고 BLESS_LIMIT_PCT 만큼 TPC 를 연다.
+    int pct = 50;
+    if (const char* e = getenv("BLESS_LIMIT_PCT")) { int v = atoi(e); if (v > 0 && v <= 100) pct = v; }
+    if (kraken_qmd_setup()) {
+      const int n = kraken_qmd_pct_to_tpc(pct);
+      kraken_qmd_set_allowed(n);
+      bless::qmd_active.store(true, std::memory_order_relaxed);
+      fprintf(stderr, "[libbless] space_mode=qmd: pct=%d → TPC %d/%d 허용 "
+                      "(요청 %.1f%% vs 실제 %.1f%%, 올림 변환)\n",
+              pct, n, bless::QMD_TPC_TOTAL, (double)pct,
+              100.0 * n / bless::QMD_TPC_TOTAL);
+    } else {
+      fprintf(stderr, "[libbless][경고] QMD 초기화 실패 — 공간 제한 없이 진행한다\n");
+    }
+  } else if (bless::space_mode.load(std::memory_order_relaxed) == bless::SPACE_MPS_ENV) {
     bless::ctx_limited = nullptr;
     bless::limited_applied.store(0);
     bless::limited_sms.store(new_sms);
@@ -574,9 +736,46 @@ static void ensure_init() {
   if (const char* m = getenv("BLESS_SPACE_MODE")) {
     if (!strcmp(m, "mps_env")) {
       bless::space_mode.store(bless::SPACE_MPS_ENV);
+    } else if (!strcmp(m, "qmd")) {
+      // [Exp_109 Q-1] QMD 모드 — 미문서 인터페이스이므로 드라이버 버전을 확인한다.
+      //   검증본과 다르면 **진입을 거부하고** 기본(ctx)으로 남는다. 조용히 무시하지 않는다.
+      // 드라이버 확인 — 컨테이너에는 /proc/driver/nvidia 가 없는 것이 보통이므로
+      //   env(BLESS_QMD_DRIVER)를 먼저 본다. 호스트 측이 주입하는 값이다.
+      char drv[64] = {0};
+      if (const char* dv = getenv("BLESS_QMD_DRIVER")) {
+        snprintf(drv, sizeof(drv), "%s", dv);
+      } else {
+        FILE* f = fopen("/proc/driver/nvidia/version", "r");
+        if (f) { char line[256];
+          if (fgets(line, sizeof(line), f)) {
+            const char* p1 = strstr(line, "Module  ");
+            if (p1) sscanf(p1 + 8, "%63s", drv);
+          }
+          fclose(f);
+        }
+      }
+      if (!drv[0]) {
+        // ★미문서 인터페이스다. 버전을 모르면 **거부**가 안전하다.
+        //   강제하려면 BLESS_QMD_FORCE=1 로 명시해 책임을 호출자에게 옮긴다.
+        if (getenv("BLESS_QMD_FORCE") && getenv("BLESS_QMD_FORCE")[0] == '1') {
+          fprintf(stderr, "[libbless][경고] QMD: 드라이버 버전 미확인이나 "
+                          "BLESS_QMD_FORCE=1 로 강제 진입한다\n");
+          bless::space_mode.store(bless::SPACE_QMD);
+        } else {
+          fprintf(stderr, "[libbless][경고] QMD 모드 거부: 드라이버 버전을 확인할 수 없다"
+                          "(BLESS_QMD_DRIVER 미주입, /proc/driver/nvidia 미가시). "
+                          "미문서 인터페이스이므로 기본 공간 모드를 유지한다. "
+                          "강제하려면 BLESS_QMD_FORCE=1\n");
+        }
+      } else if (strcmp(drv, KRAKEN_QMD_DRIVER_VERIFIED) != 0) {
+        fprintf(stderr, "[libbless][경고] QMD 모드 거부: 드라이버 %s 는 검증본(%s)이 아니다 — "
+                        "기본 공간 모드를 유지한다\n", drv, KRAKEN_QMD_DRIVER_VERIFIED);
+      } else {
+        bless::space_mode.store(bless::SPACE_QMD);
+      }
     } else if (strcmp(m, "ctx") != 0) {
       fprintf(stderr, "[libbless] BLESS_SPACE_MODE=%s 인식 불가 — 기본 ctx 사용 "
-                      "(유효값: ctx|mps_env)\n", m);
+                      "(유효값: ctx|mps_env|qmd)\n", m);
     }
   }
 
@@ -601,6 +800,27 @@ static void ensure_init() {
 
   // LIMITED ctx
   reconf_limited_ctx(init_sms);
+
+  // [Exp_109 R-1] ★class 선언을 **소켓 생성보다 먼저** 쓴다.
+  //   근본 원인: feeder 는 소켓(bless-*.sock)이 보이면 그 테넌트를 등록·판정하는데,
+  //   class 기록이 소켓 생성 뒤에 있어 소켓을 본 시점에 class 가 아직 없을 수 있었다
+  //   (Exp_108 회귀의 짝짓기 간헐 실패). 순서를 뒤집으면 **소켓이 보이는 순간 class 는
+  //   이미 파일에 있다** — 대기 시간을 늘리는 대신 경합 자체를 없앤다.
+  //   (class 기록은 getenv+fopen 뿐이라 CUDA 컨텍스트에 의존하지 않는다)
+  if (const char* cl = getenv("BLESS_CLASS_LOG")) {
+    const char* wc = getenv("KRAKEN_WORKLOAD_CLASS");
+    if (cl[0] && wc && wc[0]) {
+      if (FILE* cf = fopen(cl, "w")) {
+        fprintf(cf, "%s\n", wc);
+        fclose(cf);
+        fprintf(stderr, "[libbless] workload_class=%s → %s (relaxed 분류 선언)\n", wc, cl);
+      } else {
+        // [Exp_107 T-5] 조용한 폴백 금지
+        fprintf(stderr, "[libbless][경고] class 파일 기록 실패 path=%s — "
+                        "짝짓기 판정이 이 테넌트를 미선언으로 본다\n", cl);
+      }
+    }
+  }
 
   // control socket
   char sp[128]; snprintf(sp, sizeof(sp), "/tmp/bless-%d.sock", (int)getpid());
@@ -664,16 +884,14 @@ static void ensure_init() {
   // bless_feeder(wirer)가 쌍 판정(aggressor+victim 공존 시 victim 해제)에 쓴다.
   // ★선언 기반이라 남용 가능(memory 선언=gate 해제 유리) — 관측 검증은 MPS 하
   //   DCGM 프로세스 귀속 불가로 미구현(Exp_75 A-1). 안전 기본값은 미선언=strict.
-  if (const char* cl = getenv("BLESS_CLASS_LOG")) {
-    const char* wc = getenv("KRAKEN_WORKLOAD_CLASS");
-    if (cl[0] && wc && wc[0]) {
-      if (FILE* cf = fopen(cl, "w")) {
-        fprintf(cf, "%s\n", wc);
-        fclose(cf);
-        fprintf(stderr, "[libbless] workload_class=%s → %s (relaxed 분류 선언)\n", wc, cl);
-      }
+  // [Exp_108 D-2] 게이트 전환 계측 opt-in. 기본 꺼짐 = 기존 동작 불변.
+  if (const char* gmv = getenv("BLESS_GATE_METRICS")) {
+    if (gmv[0] == '1') {
+      bless::gate_metrics_on.store(true, std::memory_order_relaxed);
+      fprintf(stderr, "[libbless] gate_metrics=on (게이트 전환 계측)\n");
     }
   }
+
 
   bless::inited.store(true);
   pthread_mutex_unlock(&bless::init_mu);
@@ -820,6 +1038,21 @@ static void start_control_server(const std::string& path) {
       }
 
       // -------- 컨텍스트 스위칭 통계 ----------
+      // [Exp_108 D-2] 게이트 전환 통계 — 전환 1회당 비용을 여기서 낸다.
+      else if (!strncmp(buf,"gate_stats",10)) {
+        const long long n  = bless::gate_block_count.load();
+        const long long tt = bless::gate_block_total_us.load();
+        fprintf(stderr, "[libbless] gate_block: on=%d count=%lld total_us=%lld "
+                        "avg_us=%lld max_us=%lld\n",
+                (int)bless::gate_metrics_on.load(), n, tt,
+                n ? tt / n : 0LL, (long long)bless::gate_block_max_us.load());
+        if (bless::stats_log) {
+          fprintf(bless::stats_log, "gate_count=%lld gate_total_us=%lld gate_max_us=%lld\n",
+                  n, tt, (long long)bless::gate_block_max_us.load());
+          fflush(bless::stats_log);
+        }
+      }
+
       else if (!strncmp(buf,"ctx_stats",9)) {
         fprintf(stderr, "[libbless] ctx_switch: count=%lld total_us=%lld avg_us=%lld max_us=%lld\n",
                 (long long)bless::ctx_switch_count.load(),
@@ -933,6 +1166,43 @@ static void start_control_server(const std::string& path) {
       // -------- reconf ----------
       // [Exp_61] mps_env 모드에서는 공간 재설정이 프로세스 밖(MPS env, 스폰 시점
       // 고정)에 있으므로 런타임 재설정 요청을 무음 no-op 이 아니라 명시 거부한다.
+      // [Exp_109 Q-2] QMD 런타임 재설정 — 이번 실험의 핵심.
+      //   mps_env 가 못 하는 것(실행 중 공간 몫 변경)을 여기서 한다.
+      //   마스크는 전역 변수 대입뿐이고 실제 적용은 **다음 커널 런치의 콜백**에서 일어난다.
+      //   → 진행 중인 커널은 건드리지 않는다(무중단).
+      else if (!strncmp(buf,"qmd_pct ",8)) {
+        if (bless::space_mode.load() != bless::SPACE_QMD) {
+          fprintf(stderr, "[libbless][경고] qmd_pct 거부: space_mode 가 qmd 가 아니다 "
+                          "— 이전 상태를 유지한다\n");
+        } else {
+          const int64_t t0 = now_us();
+          int pct = atoi(buf + 8);
+          const int n = kraken_qmd_pct_to_tpc(pct);
+          kraken_qmd_set_allowed(n);
+          const int64_t dt = now_us() - t0;
+          bless::qmd_reconf_count.fetch_add(1, std::memory_order_relaxed);
+          bless::qmd_reconf_total_us.fetch_add(dt, std::memory_order_relaxed);
+          fprintf(stderr, "[libbless] qmd_pct=%d → TPC %d/%d (%.2f us, 다음 런치부터 적용)\n",
+                  pct, bless::qmd_allowed_tpc.load(), bless::QMD_TPC_TOTAL, (double)dt);
+        }
+      }
+
+      else if (!strncmp(buf,"qmd_stats",9)) {
+        const long long c = bless::qmd_reconf_count.load();
+        fprintf(stderr, "[libbless] qmd: active=%d allowed_tpc=%d/%d reconf=%lld "
+                        "avg_us=%lld mask=%08x,%08x,%08x\n",
+                (int)bless::qmd_active.load(), bless::qmd_allowed_tpc.load(),
+                bless::QMD_TPC_TOTAL, c,
+                c ? bless::qmd_reconf_total_us.load() / c : 0LL,
+                bless::qmd_mask_w0.load(), bless::qmd_mask_w1.load(),
+                bless::qmd_mask_w2.load());
+        if (bless::stats_log) {
+          fprintf(bless::stats_log, "qmd_allowed=%d qmd_reconf=%lld\n",
+                  bless::qmd_allowed_tpc.load(), c);
+          fflush(bless::stats_log);
+        }
+      }
+
       else if (!strncmp(buf,"reconf_sm ",10) || !strncmp(buf,"set_limit_pct ",14)) {
         if (bless::space_mode.load() == bless::SPACE_MPS_ENV) {
           fprintf(stderr, "[libbless] REJECT %s: space_mode=mps_env 는 런타임 공간 "
