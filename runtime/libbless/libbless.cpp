@@ -193,6 +193,22 @@ namespace bless {
   static std::atomic<int64_t> avg_kernel_time_us{10};  // 평균 커널 시간 추정
   static std::atomic<int64_t> total_time_us{0};        // 누적 사용 시간
 
+  // ── [Exp_146] 급함(URGENT) 등급의 크레딧 대출 ──────────────────────────
+  //   왜: 선점 명령은 **남의** 커널만 대기시킨다. 정작 급한 작업 자신은
+  //   time_credit_gate 가 막아 "남은 비켜섰는데 본인이 못 지나가는" 비대칭이
+  //   있었다(Exp_139 공백 지점, Exp_146 0부).
+  //   방식: 무제한 통과가 아니라 **빌려쓰고 갚는다.** 크레딧을 -한도까지
+  //   허용하고, 차감은 기존 적자 이월 경로(time_batch_end_and_charge)가 그대로
+  //   하므로 다음 충전분에서 자동 회수된다 → **총량 보존**.
+  //   한도 기본값 10000us = feeder 충전 주기 TICK_S 0.010s(Exp_16 검증값)의 1주기분.
+  //   임의 상수가 아니다 — 커널 1회 실행 2~6ms(실측)를 덮으면서 다음 충전까지의
+  //   최대 공백을 넘지 않는 값이다. feeder 가 arm 시 `urgent_limit` 로 같은 값을
+  //   내려보내 둘이 어긋나지 않게 한다.
+  static std::atomic<int64_t> urgent_limit_us{10000};  // 대출 한도(양수 = |음수 크레딧| 상한)
+  static std::atomic<int64_t> urgent_borrow_events{0}; // 대출 발생 횟수(관측)
+  static std::atomic<int64_t> urgent_borrow_us{0};     // 누적 대출량(관측)
+  static std::atomic<int64_t> urgent_denied{0};        // 한도 초과로 막힌 횟수(관측)
+
   // 샘플링 측정용
   static std::atomic<int>     sample_counter{0};
   static std::atomic<int64_t> sample_start_us{0};
@@ -492,6 +508,21 @@ static inline void time_credit_gate() {
   if (__builtin_expect(bless::time_unlimited.load(std::memory_order_relaxed), 1)) return;
   int64_t credit = bless::time_credit_us.load(std::memory_order_relaxed);
   if (credit > 0) return;
+  // ── [Exp_146 2부] 급함 등급은 한도까지 빌려서 지나간다 ────────────────
+  //   ★등급 조회는 이 자리에서만 한다 — credit>0 인 빠른 경로(대다수 커널)는
+  //     위에서 이미 반환했으므로 커널당 비용이 늘지 않는다(4부 L 실측).
+  //   미선언(=NORMAL 기본값)은 기존 동작 그대로 — 실패로 막지 않는다.
+  if (bless::current_priority.load(std::memory_order_relaxed) == bless::URGENT) {
+    const int64_t lim = bless::urgent_limit_us.load(std::memory_order_relaxed);
+    if (credit > -lim) {
+      // 빌린 만큼은 차감 경로(적자 이월)가 다음 충전분에서 회수한다.
+      bless::urgent_borrow_events.fetch_add(1, std::memory_order_relaxed);
+      bless::urgent_borrow_us.fetch_add(-credit, std::memory_order_relaxed);
+      return;
+    }
+    // 한도 소진 — 무한 대출 경로를 만들지 않는다. 갚을 때까지 보통과 같이 막힌다.
+    bless::urgent_denied.fetch_add(1, std::memory_order_relaxed);
+  }
   // [Exp_16 보강 ③] 대기 전에 열린 배치를 먼저 청구하고 창을 닫는다 —
   // 원본은 배치 창이 열린 채 게이트에서 대기해 "대기 시간까지 사용으로 청구"
   // (Exp_16 실측: 청구량 ≈ 벽시계 전체). 대기 시간은 사용이 아니다.
@@ -500,7 +531,14 @@ static inline void time_credit_gate() {
   const bool gm = bless::gate_metrics_on.load(std::memory_order_relaxed);
   const int64_t gate_t0 = gm ? now_us() : 0;
   int waited = 0;
-  while (credit <= 0) {
+  // [Exp_146] 급함은 **한도 안으로 갚아지는 즉시** 재개한다(보통은 종전대로 0 초과).
+  //   충전이 한도 경계를 밀어 올린 만큼만 나가므로 무한 대출이 되지 않는다 —
+  //   진행 속도는 결국 자기 몫의 충전 속도에 묶인다(4부 F 실측).
+  const int64_t wake_at =
+      (bless::current_priority.load(std::memory_order_relaxed) == bless::URGENT)
+          ? -bless::urgent_limit_us.load(std::memory_order_relaxed)
+          : 0;
+  while (credit <= wake_at) {
     if (waited < 50) {
       ++waited;
       sched_yield();
@@ -822,6 +860,30 @@ static void ensure_init() {
     }
   }
 
+  // ── [Exp_146 3부] KRAKEN_PRIORITY 소비 — 지금까지 소비처가 0이었다 ──────
+  //   webhook 이 annotation `kraken.keti.re.kr/priority` 를 이 env 로 주입하는데
+  //   (Exp_139 K03) 읽는 곳이 없어 고려대가 값을 달아도 아무 일도 없었다.
+  //   매핑(규격 반영 대상): high→URGENT(0) · med|medium|normal→NORMAL(1) ·
+  //   low→BACKGROUND(2). 미선언은 보통, 잘못된 값도 보통으로 떨어뜨리고 경고한다
+  //   (실패로 막지 않는다 — 지시서 3부).
+  if (const char* pr = getenv("KRAKEN_PRIORITY")) {
+    int p = -1;
+    if (!strcasecmp(pr, "high"))                                   p = bless::URGENT;
+    else if (!strcasecmp(pr, "med") || !strcasecmp(pr, "medium")
+             || !strcasecmp(pr, "normal"))                         p = bless::NORMAL;
+    else if (!strcasecmp(pr, "low"))                               p = bless::BACKGROUND;
+    if (p >= 0) {
+      bless::current_priority.store(p, std::memory_order_release);
+      fprintf(stderr, "[libbless] priority=%d (%s) ← KRAKEN_PRIORITY=%s "
+                      "(annotation 배선, Exp_146)\n",
+              p, p==0 ? "URGENT" : (p==1 ? "NORMAL" : "BACKGROUND"), pr);
+    } else if (pr[0]) {
+      // [T-5] 조용히 넘기지 않는다
+      fprintf(stderr, "[libbless][경고] KRAKEN_PRIORITY=%s 는 알 수 없는 값 — "
+                      "보통(NORMAL)으로 진행한다. 유효값: high|med|low\n", pr);
+    }
+  }
+
   // control socket
   char sp[128]; snprintf(sp, sizeof(sp), "/tmp/bless-%d.sock", (int)getpid());
   bless::sock_path = sp;
@@ -1117,6 +1179,26 @@ static void start_control_server(const std::string& path) {
         bless::urgent_pending.store(true, std::memory_order_release);
         bless::preempt_requested.store(true, std::memory_order_release);
         fprintf(stderr, "[libbless] urgent preemption requested\n");
+      }
+      // [Exp_146] 대출 한도 설정 — feeder 가 arm 시 TICK_S 1주기분을 내려보낸다.
+      //   코드 기본값(10000us)과 같은 값이라 둘이 어긋나지 않는다.
+      else if (!strncmp(buf,"urgent_limit ",13)) {
+        long long v = atoll(buf+13);
+        if (v >= 0) {
+          bless::urgent_limit_us.store((int64_t)v, std::memory_order_release);
+          fprintf(stderr, "[libbless] urgent_limit=%lldus\n", v);
+        }
+      }
+      // [Exp_146] 대출 관측 — 조용히 빌리면 계약이 언제 깨졌는지 모른다.
+      else if (!strncmp(buf,"urgent_stats",12)) {
+        fprintf(stderr, "[libbless] urgent: limit_us=%lld borrow_events=%lld "
+                "borrow_us=%lld denied=%lld credit=%lld priority=%d\n",
+                (long long)bless::urgent_limit_us.load(),
+                (long long)bless::urgent_borrow_events.load(),
+                (long long)bless::urgent_borrow_us.load(),
+                (long long)bless::urgent_denied.load(),
+                (long long)bless::time_credit_us.load(),
+                bless::current_priority.load());
       }
       // Urgent 선점 해제
       else if (!strncmp(buf,"urgent_clear",12)) {
