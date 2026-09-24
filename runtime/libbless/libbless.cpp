@@ -253,6 +253,19 @@ namespace bless {
   static std::atomic<int64_t> gate_block_count{0};
   static std::atomic<int64_t> gate_block_total_us{0};
   static std::atomic<int64_t> gate_block_max_us{0};       // 최대 컨텍스트 스위치 시간(us)
+
+  // ── [Exp_158] 시간축 work-conserving 시제 (opt-in, 기본 꺼짐) ─────────────
+  //   NPU gate_core 의 WC(편승=charged_extra 분리, Exp_85/124)를 GPU 게이트로 이식한
+  //   최소형. GPU 게이트는 남의 커널 실행을 모르므로 feeder 가 틱마다 관측한
+  //   peer 유휴 신호(소켓 "peer_idle 0|1")를 근사로 쓴다 — 신선도 2틱(20ms) 안에서만
+  //   믿는다(1틱 push 주기 + 전달 여유 1틱. 새 상수가 아니라 틱 배수).
+  //   편승 실행분은 total(계약 회계)에 넣지 않고 크레딧도 차감하지 않는다 —
+  //   이행 판정 밖(wc_extra_us). ★기본 꺼짐: BLESS_TIME_WC=1 일 때만.
+  static std::atomic<bool>    wc_on{false};
+  static std::atomic<bool>    peer_idle{false};
+  static std::atomic<int64_t> peer_idle_at_us{0};
+  static std::atomic<int64_t> wc_pass_count{0};
+  static std::atomic<int64_t> wc_extra_us{0};
   // =============================================
 
   // ======== 우선순위 기반 커널 큐 시스템 ========
@@ -367,11 +380,25 @@ static inline void time_batch_start() {
 }
 
 // 동기화 시점에 실제 시간 측정 및 크레딧 차감
+// [Exp_158] 이 스레드의 현재 배치가 WC 편승인가 — 게이트 통과 시 세우고
+//   청구 시점에 분리 회계 후 내린다(배치와 같은 thread_local 수명).
+static thread_local bool tl_wc_riding = false;
+
 static inline void time_batch_end_and_charge() {
   if (tl_batch_kernel_count == 0) return;
 
   int64_t elapsed_us = now_us() - tl_batch_start_us;
   int kernel_count = tl_batch_kernel_count;
+
+  // [Exp_158] 편승 배치 — 계약 회계(total)에 넣지 않고 크레딧도 차감하지 않는다.
+  //   NPU 의 charged/charged_extra 분리 규칙(Exp_124) 그대로: 편승분은 이행 판정 밖.
+  if (tl_wc_riding) {
+    bless::wc_extra_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+    tl_wc_riding = false;
+    tl_batch_kernel_count = 0;
+    tl_batch_start_us = 0;
+    return;
+  }
 
   // 누적 시간 기록
   bless::total_time_us.fetch_add(elapsed_us, std::memory_order_relaxed);
@@ -539,6 +566,16 @@ static inline void time_credit_gate() {
           ? -bless::urgent_limit_us.load(std::memory_order_relaxed)
           : 0;
   while (credit <= wake_at) {
+    // [Exp_158] WC 통과 — peer 가 유휴(신선한 신호)면 막지 않고 편승으로 지나간다.
+    //   peer 가 재개하면 feeder 가 다음 틱에 0 을 보내 편승이 끊긴다(연속 남용 없음).
+    if (bless::wc_on.load(std::memory_order_relaxed) &&
+        bless::peer_idle.load(std::memory_order_relaxed) &&
+        (now_us() - bless::peer_idle_at_us.load(std::memory_order_relaxed)) < 20000 /*2틱*/) {
+      tl_wc_riding = true;
+      bless::wc_pass_count.fetch_add(1, std::memory_order_relaxed);
+      if (gm) bless_gate_block_record(gate_t0);
+      return;
+    }
     if (waited < 50) {
       ++waited;
       sched_yield();
@@ -946,6 +983,14 @@ static void ensure_init() {
   // bless_feeder(wirer)가 쌍 판정(aggressor+victim 공존 시 victim 해제)에 쓴다.
   // ★선언 기반이라 남용 가능(memory 선언=gate 해제 유리) — 관측 검증은 MPS 하
   //   DCGM 프로세스 귀속 불가로 미구현(Exp_75 A-1). 안전 기본값은 미선언=strict.
+  // [Exp_158] 시간축 WC 시제 opt-in. 기본 꺼짐 = 기존 동작 불변.
+  if (const char* wcv = getenv("BLESS_TIME_WC")) {
+    if (wcv[0] == '1') {
+      bless::wc_on.store(true, std::memory_order_relaxed);
+      fprintf(stderr, "[libbless] time_wc=on (편승 분리 회계 — Exp_158 시제)\n");
+    }
+  }
+
   // [Exp_108 D-2] 게이트 전환 계측 opt-in. 기본 꺼짐 = 기존 동작 불변.
   if (const char* gmv = getenv("BLESS_GATE_METRICS")) {
     if (gmv[0] == '1') {
@@ -1097,6 +1142,19 @@ static void start_control_server(const std::string& path) {
                   (long long)bless::kernel_seq.load());
           fflush(bless::stats_log);
         }
+      }
+
+      // [Exp_158] WC peer 유휴 신호 수신 + 통계
+      else if (!strncmp(buf,"peer_idle",9)) {
+        int v = atoi(buf+9);
+        bless::peer_idle.store(v != 0, std::memory_order_relaxed);
+        bless::peer_idle_at_us.store(now_us(), std::memory_order_relaxed);
+      }
+      else if (!strncmp(buf,"wc_stats",8)) {
+        fprintf(stderr, "[libbless] wc: on=%d pass=%lld extra_us=%lld\n",
+                (int)bless::wc_on.load(),
+                (long long)bless::wc_pass_count.load(),
+                (long long)bless::wc_extra_us.load());
       }
 
       // -------- 컨텍스트 스위칭 통계 ----------
